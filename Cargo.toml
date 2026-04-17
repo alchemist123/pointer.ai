@@ -1,0 +1,21 @@
+[package]
+name = "pointer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pointer"
+path = "src/main.rs"
+
+[dependencies]
+cocoa = "0.26"
+objc = "0.2"
+dispatch = "0.2"
+
+[lints.rust]
+# cocoa 0.26 and objc 0.2 are deprecated in favour of the objc2 ecosystem;
+# the APIs still work correctly — suppress until we migrate.
+deprecated = "allow"
+# The objc 0.2 msg_send! macro emits #[cfg(cargo-clippy)] which the compiler
+# does not recognise as a built-in cfg name.
+unexpected_cfgs = "allow"
