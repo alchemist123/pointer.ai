@@ -19,11 +19,15 @@ use std::thread;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const DOT_SZ: f64 = 44.0;
-const IN_W:   f64 = 260.0;
-const IN_H:   f64 = 72.0;
-const STEP_W: f64 = 310.0;
-const STEP_H: f64 = 172.0;
+const DOT_SZ:  f64 = 44.0;
+const IN_W:    f64 = 260.0;
+const IN_H:    f64 = 72.0;
+const STEP_W:  f64 = 310.0;
+const STEP_H:  f64 = 172.0;
+const HINT_W:  f64 = 148.0;
+const HINT_H:  f64 = 26.0;
+const CLRP_W:  f64 = 216.0;
+const CLRP_H:  f64 = 72.0;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 // 0 = hidden
@@ -74,6 +78,12 @@ static ANIM_TICK:        AtomicU32 = AtomicU32::new(0);
 static COMPLETE_COUNTDOWN: AtomicI32 = AtomicI32::new(-1);
 static GOAL_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
 
+// Action hint pill near dot + colour picker
+static DOT_COLOR:     AtomicU8  = AtomicU8::new(0); // 0=blue 1=red 2=green 3=orange 4=purple
+static HINT_WIN_PTR:  OnceLock<usize> = OnceLock::new();
+static HINT_LBL_PTR:  OnceLock<usize> = OnceLock::new();
+static COLOR_WIN_PTR: OnceLock<usize> = OnceLock::new();
+
 // ── Accessors ─────────────────────────────────────────────────────────────────
 
 #[inline] unsafe fn dot_win()       -> id { *DOT_WIN_PTR.get().unwrap()       as id }
@@ -83,6 +93,18 @@ static GOAL_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
 #[inline] unsafe fn display_field() -> id { *DISPLAY_FIELD_PTR.get().unwrap() as id }
 #[inline] unsafe fn placeholder()   -> id { *PLACEHOLDER_PTR.get().unwrap()   as id }
 #[inline] unsafe fn step_win()      -> id { *STEP_WIN_PTR.get().unwrap()      as id }
+#[inline] unsafe fn hint_win()      -> id { *HINT_WIN_PTR.get().unwrap()       as id }
+#[inline] unsafe fn color_win()     -> id { *COLOR_WIN_PTR.get().unwrap()      as id }
+
+fn dot_color_rgb() -> (f64, f64, f64) {
+    match DOT_COLOR.load(Ordering::SeqCst) {
+        1 => (1.00, 0.22, 0.15), // red
+        2 => (0.12, 0.75, 0.30), // green
+        3 => (1.00, 0.55, 0.05), // orange
+        4 => (0.65, 0.20, 0.90), // purple
+        _ => (0.10, 0.50, 1.00), // blue (default)
+    }
+}
 
 #[inline] unsafe fn redraw_dot() {
     let _: () = msg_send![dot_view(), setNeedsDisplay: YES];
@@ -178,6 +200,8 @@ unsafe fn to_hidden_impl() {
     let _: () = msg_send![dot_win(),  orderOut: nil as id];
     let _: () = msg_send![in_panel(), orderOut: nil as id];
     let _: () = msg_send![step_win(), orderOut: nil as id];
+    if HINT_WIN_PTR.get().is_some() { let _: () = msg_send![hint_win(),  orderOut: nil as id]; }
+    if COLOR_WIN_PTR.get().is_some(){ let _: () = msg_send![color_win(), orderOut: nil as id]; }
     let _: () = msg_send![dot_win(),  setIgnoresMouseEvents: NO];
     if let Some(m) = INPUT_TEXT.get()  { if let Ok(mut g) = m.lock() { g.clear(); } }
     if let Some(m) = TOUR_AGENT.get()  { if let Ok(mut g) = m.lock() { *g = None; } }
@@ -318,10 +342,30 @@ fn show_step(step: AgentStep) {
             display: YES
         ];
 
+        // Show action-hint pill below the dot.
+        let hint_text = match step.action.as_str() {
+            "Click"        => "👆  Click here",
+            "Double-click" => "👆  Double-click here",
+            "Right-click"  => "🖱  Right-click here",
+            "Type"         => "⌨  Type here",
+            "Scroll"       => "↕  Scroll here",
+            "Hover"        => "👀  Hover here",
+            _              => "↗  Do this",
+        };
+        let hlbl: id = *HINT_LBL_PTR.get().unwrap() as id;
+        let _: () = msg_send![hlbl, setStringValue: NSString::alloc(nil).init_str(hint_text)];
+        let hx = (step.x - HINT_W/2.0).max(8.0).min(sf.size.width - HINT_W - 8.0);
+        let hy = (step.y - DOT_SZ/2.0 - HINT_H - 6.0).max(8.0);
+        let _: () = msg_send![hint_win(),
+            setFrame: NSRect::new(NSPoint::new(hx, hy), NSSize::new(HINT_W, HINT_H))
+            display: YES
+        ];
+
         STEP_IS_FINAL.store(step.is_final, Ordering::SeqCst);
         BLINK_TICK.store(0, Ordering::SeqCst);
         APP_STATE.store(4, Ordering::SeqCst);
         let _: () = msg_send![step_win(), orderFrontRegardless];
+        let _: () = msg_send![hint_win(), orderFrontRegardless];
         let _: () = msg_send![dot_win(),  orderFrontRegardless];
         redraw_dot();
     }
@@ -357,6 +401,7 @@ fn on_next_step_pressed() {
     }
     unsafe {
         let _: () = msg_send![step_win(), orderOut: nil as id];
+        let _: () = msg_send![hint_win(), orderOut: nil as id];
         let _: () = msg_send![dot_win(),  setIgnoresMouseEvents: NO];
         LOAD_TICK.store(0, Ordering::SeqCst);
         APP_STATE.store(3, Ordering::SeqCst);
@@ -367,7 +412,8 @@ fn on_next_step_pressed() {
 }
 
 unsafe fn show_completion() {
-    let _: () = msg_send![dot_win(), orderOut: nil as id];
+    let _: () = msg_send![dot_win(),  orderOut: nil as id];
+    let _: () = msg_send![hint_win(), orderOut: nil as id];
 
     let goal = GOAL_TEXT.get()
         .and_then(|m| m.lock().ok())
@@ -425,13 +471,14 @@ unsafe fn register_pointer_view() -> *const Class {
                 1 | 4 => {
                     let a = f32::from_bits(BLINK_ALPHA.load(Ordering::SeqCst)) as f64;
                     let t = (a - 0.22) / 0.71;
+                    let (cr, cg, cb) = dot_color_rgb();
                     // Glow
                     let gr = 17.0 + 7.0 * t;
                     let glow: id = msg_send![class!(NSBezierPath),
                         bezierPathWithOvalInRect: NSRect::new(
                             NSPoint::new(cx-gr, cy-gr), NSSize::new(gr*2.0, gr*2.0))];
                     let gc: id = msg_send![class!(NSColor),
-                        colorWithRed:0.20 green:0.55 blue:1.00 alpha: a*0.28];
+                        colorWithRed:cr green:cg blue:cb alpha: a*0.28];
                     let _: () = msg_send![gc, set]; let _: () = msg_send![glow, fill];
                     // Ring
                     let rr = 10.0 + 2.0 * t;
@@ -440,7 +487,7 @@ unsafe fn register_pointer_view() -> *const Class {
                             NSPoint::new(cx-rr, cy-rr), NSSize::new(rr*2.0, rr*2.0))];
                     let _: () = msg_send![ring, setLineWidth: 1.5_f64];
                     let rc: id = msg_send![class!(NSColor),
-                        colorWithRed:0.25 green:0.60 blue:1.00 alpha: a*0.75];
+                        colorWithRed:cr green:cg blue:cb alpha: a*0.75];
                     let _: () = msg_send![rc, set]; let _: () = msg_send![ring, stroke];
                     // Core
                     let ir = 5.0 + 1.5 * t;
@@ -448,7 +495,7 @@ unsafe fn register_pointer_view() -> *const Class {
                         bezierPathWithOvalInRect: NSRect::new(
                             NSPoint::new(cx-ir, cy-ir), NSSize::new(ir*2.0, ir*2.0))];
                     let dc: id = msg_send![class!(NSColor),
-                        colorWithRed:0.10 green:0.50 blue:1.00 alpha: a];
+                        colorWithRed:cr green:cg blue:cb alpha: a];
                     let _: () = msg_send![dc, set]; let _: () = msg_send![dot, fill];
                     // Specular
                     let sa = ((a - 0.60) * 2.5).max(0.0).min(1.0) * 0.60;
@@ -464,12 +511,13 @@ unsafe fn register_pointer_view() -> *const Class {
                 }
                 3 => {
                     let tick = LOAD_TICK.load(Ordering::SeqCst);
+                    let (cr, cg, cb) = dot_color_rgb();
                     let ir = 5.0_f64;
                     let dot: id = msg_send![class!(NSBezierPath),
                         bezierPathWithOvalInRect: NSRect::new(
                             NSPoint::new(cx-ir, cy-ir), NSSize::new(ir*2.0, ir*2.0))];
                     let dc: id = msg_send![class!(NSColor),
-                        colorWithRed:0.10 green:0.50 blue:1.00 alpha:0.35];
+                        colorWithRed:cr green:cg blue:cb alpha:0.35];
                     let _: () = msg_send![dc, set]; let _: () = msg_send![dot, fill];
                     let start = 90.0 - (tick as f64 * 9.0) % 360.0;
                     let arc: id = msg_send![class!(NSBezierPath), bezierPath];
@@ -478,7 +526,7 @@ unsafe fn register_pointer_view() -> *const Class {
                         radius: 13.0_f64 startAngle: start endAngle: start-270.0 clockwise: YES];
                     let _: () = msg_send![arc, setLineWidth: 2.5_f64];
                     let ac: id = msg_send![class!(NSColor),
-                        colorWithRed:0.15 green:0.55 blue:1.00 alpha:0.90];
+                        colorWithRed:cr green:cg blue:cb alpha:0.90];
                     let _: () = msg_send![ac, set]; let _: () = msg_send![arc, stroke];
                 }
                 _ => {}
@@ -576,6 +624,7 @@ unsafe fn build_input_panel(ctrl: id) -> id {
     let _: () = msg_send![panel, setHasShadow: YES];
     let _: () = msg_send![panel, setFloatingPanel: YES];
     let _: () = msg_send![panel, setCollectionBehavior: 1u64];
+    let _: () = msg_send![panel, setHidesOnDeactivate: NO];
 
     let ve: id = msg_send![class!(NSVisualEffectView), alloc];
     let ve: id = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(IN_W,IN_H))];
@@ -600,6 +649,22 @@ unsafe fn build_input_panel(ctrl: id) -> id {
     let gc: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.25_f64];
     let _: () = msg_send![grip, setTextColor: gc];
     let _: () = msg_send![ve, addSubview: grip];
+
+    // Gear / settings button in the top-right of the drag strip
+    let gear: id = msg_send![class!(NSButton), alloc];
+    let gear: id = msg_send![gear,
+        initWithFrame: NSRect::new(NSPoint::new(IN_W-20.0, IN_H-16.0), NSSize::new(18.0, 16.0))
+    ];
+    let _: () = msg_send![gear, setBezelStyle: 0_i64];
+    let _: () = msg_send![gear, setBordered: NO];
+    let _: () = msg_send![gear, setTitle: NSString::alloc(nil).init_str("⚙")];
+    let gear_font: id = msg_send![class!(NSFont), systemFontOfSize: 11.0_f64];
+    let _: () = msg_send![gear, setFont: gear_font];
+    let gear_col: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.45_f64];
+    let _: () = msg_send![gear, setContentTintColor: gear_col];
+    let _: () = msg_send![gear, setAction: sel!(showColorPanel:)];
+    let _: () = msg_send![gear, setTarget: ctrl];
+    let _: () = msg_send![ve, addSubview: gear];
 
     // Text input box
     let ch = IN_H - 16.0;
@@ -707,6 +772,7 @@ unsafe fn build_step_panel(ctrl: id) -> id {
     let _: () = msg_send![panel, setHasShadow: YES];
     let _: () = msg_send![panel, setFloatingPanel: YES];
     let _: () = msg_send![panel, setCollectionBehavior: 1u64];
+    let _: () = msg_send![panel, setHidesOnDeactivate: NO];
 
     let ve: id = msg_send![class!(NSVisualEffectView), alloc];
     let ve: id = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(STEP_W, STEP_H))];
@@ -811,6 +877,132 @@ unsafe fn ensure_accessibility() {
     let val: id = msg_send![class!(NSNumber), numberWithBool: YES];
     let opts: id = msg_send![class!(NSDictionary), dictionaryWithObject:val forKey:key];
     AXIsProcessTrustedWithOptions(opts);
+}
+
+// ── Action-hint pill near the dot ─────────────────────────────────────────────
+
+unsafe fn build_hint_panel() -> id {
+    let panel: id = msg_send![class!(NSPanel), alloc];
+    let panel: id = msg_send![panel,
+        initWithContentRect: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(HINT_W, HINT_H))
+        styleMask: 0u64 backing: 2u64 defer: NO
+    ];
+    let _: () = msg_send![panel, setOpaque: NO];
+    let clear: id = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![panel, setBackgroundColor: clear];
+    let _: () = msg_send![panel, setLevel: 25_i64];
+    let _: () = msg_send![panel, setHasShadow: NO];
+    let _: () = msg_send![panel, setIgnoresMouseEvents: YES];
+    let _: () = msg_send![panel, setCollectionBehavior: 1u64];
+    let _: () = msg_send![panel, setHidesOnDeactivate: NO];
+
+    let bg: id = msg_send![class!(NSView), alloc];
+    let bg: id = msg_send![bg,
+        initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(HINT_W, HINT_H))
+    ];
+    let _: () = msg_send![bg, setWantsLayer: YES];
+    let bgl: id = msg_send![bg, layer];
+    let bgc: id = msg_send![class!(NSColor), colorWithRed:0.07 green:0.07 blue:0.09 alpha:0.84_f64];
+    let cg_bgc: id = msg_send![bgc, CGColor];
+    let _: () = msg_send![bgl, setBackgroundColor: cg_bgc];
+    let _: () = msg_send![bgl, setCornerRadius: HINT_H/2.0];
+    let _: () = msg_send![panel, setContentView: bg];
+
+    let lbl: id = msg_send![class!(NSTextField), alloc];
+    let lbl: id = msg_send![lbl,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 1.0), NSSize::new(HINT_W, HINT_H-2.0))
+    ];
+    let _: () = msg_send![lbl, setEditable: NO]; let _: () = msg_send![lbl, setBezeled: NO];
+    let _: () = msg_send![lbl, setDrawsBackground: NO]; let _: () = msg_send![lbl, setSelectable: NO];
+    let _: () = msg_send![lbl, setAlignment: 2_i64];
+    let lf: id = msg_send![class!(NSFont), boldSystemFontOfSize: 11.0_f64];
+    let _: () = msg_send![lbl, setFont: lf];
+    let wc: id = msg_send![class!(NSColor), whiteColor];
+    let _: () = msg_send![lbl, setTextColor: wc];
+    let _: () = msg_send![bg, addSubview: lbl];
+
+    HINT_LBL_PTR.set(lbl as usize).unwrap();
+    panel
+}
+
+// ── Pointer colour picker ─────────────────────────────────────────────────────
+
+unsafe fn build_color_panel(ctrl: id) -> id {
+    let panel: id = msg_send![class!(NSPanel), alloc];
+    let panel: id = msg_send![panel,
+        initWithContentRect: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(CLRP_W, CLRP_H))
+        styleMask: 0u64 backing: 2u64 defer: NO
+    ];
+    let _: () = msg_send![panel, setOpaque: NO];
+    let clear: id = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![panel, setBackgroundColor: clear];
+    let _: () = msg_send![panel, setLevel: 26_i64];
+    let _: () = msg_send![panel, setHasShadow: YES];
+    let _: () = msg_send![panel, setCollectionBehavior: 1u64];
+    let _: () = msg_send![panel, setHidesOnDeactivate: NO];
+
+    let ve: id = msg_send![class!(NSVisualEffectView), alloc];
+    let ve: id = msg_send![ve,
+        initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(CLRP_W, CLRP_H))
+    ];
+    let _: () = msg_send![ve, setMaterial: 13_i64];
+    let _: () = msg_send![ve, setBlendingMode: 0_i64];
+    let _: () = msg_send![ve, setState: 1_i64];
+    let _: () = msg_send![ve, setWantsLayer: YES];
+    let vel: id = msg_send![ve, layer];
+    let _: () = msg_send![vel, setCornerRadius: 12.0_f64];
+    let _: () = msg_send![vel, setMasksToBounds: YES];
+    let _: () = msg_send![panel, setContentView: ve];
+
+    // Header
+    let hdr: id = msg_send![class!(NSTextField), alloc];
+    let hdr: id = msg_send![hdr,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, CLRP_H-22.0), NSSize::new(CLRP_W, 18.0))
+    ];
+    let _: () = msg_send![hdr, setEditable: NO]; let _: () = msg_send![hdr, setBezeled: NO];
+    let _: () = msg_send![hdr, setDrawsBackground: NO]; let _: () = msg_send![hdr, setSelectable: NO];
+    let _: () = msg_send![hdr, setAlignment: 2_i64];
+    let hf: id = msg_send![class!(NSFont), systemFontOfSize: 11.0_f64];
+    let _: () = msg_send![hdr, setFont: hf];
+    let dimc: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.55_f64];
+    let _: () = msg_send![hdr, setTextColor: dimc];
+    let _: () = msg_send![hdr, setStringValue: NSString::alloc(nil).init_str("Pointer colour")];
+    let _: () = msg_send![ve, addSubview: hdr];
+
+    // Five colour swatches
+    let swatches: [(f64, f64, f64); 5] = [
+        (0.10, 0.50, 1.00), // blue
+        (1.00, 0.22, 0.15), // red
+        (0.12, 0.75, 0.30), // green
+        (1.00, 0.55, 0.05), // orange
+        (0.65, 0.20, 0.90), // purple
+    ];
+    let sz  = 30.0_f64;
+    let gap = 8.0_f64;
+    let row_w = swatches.len() as f64 * sz + (swatches.len()-1) as f64 * gap;
+    let sx0 = (CLRP_W - row_w) / 2.0;
+    let sy  = (CLRP_H - 22.0 - sz) / 2.0;
+    for (i, &(r, g, b)) in swatches.iter().enumerate() {
+        let sx = sx0 + i as f64 * (sz + gap);
+        let btn: id = msg_send![class!(NSButton), alloc];
+        let btn: id = msg_send![btn,
+            initWithFrame: NSRect::new(NSPoint::new(sx, sy), NSSize::new(sz, sz))
+        ];
+        let _: () = msg_send![btn, setBezelStyle: 0_i64];
+        let _: () = msg_send![btn, setBordered: NO];
+        let _: () = msg_send![btn, setWantsLayer: YES];
+        let bl: id = msg_send![btn, layer];
+        let col: id = msg_send![class!(NSColor), colorWithRed:r green:g blue:b alpha:1.0_f64];
+        let cg:  id = msg_send![col, CGColor];
+        let _: () = msg_send![bl, setBackgroundColor: cg];
+        let _: () = msg_send![bl, setCornerRadius: sz/2.0];
+        let _: () = msg_send![btn, setTitle: NSString::alloc(nil).init_str("")];
+        let _: () = msg_send![btn, setTag: i as i64];
+        let _: () = msg_send![btn, setAction: sel!(colorSelected:)];
+        let _: () = msg_send![btn, setTarget: ctrl];
+        let _: () = msg_send![ve, addSubview: btn];
+    }
+    panel
 }
 
 // ── CGEventTap ────────────────────────────────────────────────────────────────
@@ -1030,9 +1222,40 @@ fn main() {
             dispatch::Queue::main().exec_async(on_next_step_pressed);
         }
 
+        extern "C" fn show_color_panel(_: &Object, _: Sel, _: id) {
+            unsafe {
+                let cp: id = color_win();
+                // Position above the input panel
+                let ip_f: NSRect = msg_send![in_panel(), frame];
+                let px = ip_f.origin.x + (IN_W - CLRP_W) / 2.0;
+                let py = ip_f.origin.y + IN_H + 6.0;
+                let _: () = msg_send![cp,
+                    setFrame: NSRect::new(NSPoint::new(px, py), NSSize::new(CLRP_W, CLRP_H))
+                    display: YES
+                ];
+                let visible: BOOL = msg_send![cp, isVisible];
+                if visible == YES {
+                    let _: () = msg_send![cp, orderOut: nil as id];
+                } else {
+                    let _: () = msg_send![cp, orderFrontRegardless];
+                }
+            }
+        }
+
+        extern "C" fn color_selected(_: &Object, _: Sel, sender: id) {
+            unsafe {
+                let tag: i64 = msg_send![sender, tag];
+                DOT_COLOR.store(tag as u8, Ordering::SeqCst);
+                let _: () = msg_send![color_win(), orderOut: nil as id];
+                redraw_dot();
+            }
+        }
+
         ctrl_decl.add_method(sel!(pulse:),           pulse            as extern "C" fn(&Object, Sel, id));
         ctrl_decl.add_method(sel!(enterPressed:),    enter_pressed    as extern "C" fn(&Object, Sel, id));
         ctrl_decl.add_method(sel!(nextStepPressed:), next_step_pressed as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(showColorPanel:),  show_color_panel as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(colorSelected:),   color_selected   as extern "C" fn(&Object, Sel, id));
         let ctrl_class = ctrl_decl.register();
         let ctrl: id = msg_send![ctrl_class, alloc];
         let ctrl: id = msg_send![ctrl, init];
@@ -1064,6 +1287,14 @@ fn main() {
         // ── Step panel ────────────────────────────────────────────────────────
         let step_panel = build_step_panel(ctrl);
         STEP_WIN_PTR.set(step_panel as usize).unwrap();
+
+        // ── Action hint pill ──────────────────────────────────────────────────
+        let hint_panel = build_hint_panel();
+        HINT_WIN_PTR.set(hint_panel as usize).unwrap();
+
+        // ── Colour picker ─────────────────────────────────────────────────────
+        let color_panel = build_color_panel(ctrl);
+        COLOR_WIN_PTR.set(color_panel as usize).unwrap();
 
         // ── 50 ms animation timer ─────────────────────────────────────────────
         let _: id = msg_send![class!(NSTimer),
