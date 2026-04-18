@@ -3,9 +3,21 @@ use serde::Deserialize;
 use std::io::Read;
 use std::process::Command;
 
-const GROQ_API_KEY: &str = "";
-const GROQ_MODEL:   &str = "meta-llama/llama-4-scout-17b-16e-instruct";
-const GROQ_URL:     &str = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODEL_DEFAULT: &str = "meta-llama/llama-4-maverick-17b-128e-instruct";
+const GROQ_URL_DEFAULT:   &str = "https://api.groq.com/openai/v1/chat/completions";
+
+fn groq_api_key() -> String {
+    std::env::var("GROQ_API_KEY")
+        .expect("GROQ_API_KEY environment variable is not set")
+}
+
+fn groq_model() -> String {
+    std::env::var("GROQ_MODEL").unwrap_or_else(|_| GROQ_MODEL_DEFAULT.to_owned())
+}
+
+fn groq_url() -> String {
+    std::env::var("GROQ_URL").unwrap_or_else(|_| GROQ_URL_DEFAULT.to_owned())
+}
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -61,7 +73,6 @@ impl TourAgent {
     }
 
     pub fn next_step(&mut self) -> Result<AgentStep, String> {
-        // Capture screenshot, resize to logical dimensions, get actual output size.
         let (b64, img_w, img_h) = capture_screenshot(
             self.screen_w as u32, self.screen_h as u32,
         )?;
@@ -74,10 +85,8 @@ impl TourAgent {
         self.step_num += 1;
         let n = self.step_num;
 
-        // Scale from image pixels to logical screen points (handles any sips rounding).
         let lx = raw.x * (self.screen_w / img_w as f64);
         let ly = raw.y * (self.screen_h / img_h as f64);
-        // Flip y: image origin is top-left; NS screen origin is bottom-left.
         let ns_y = self.screen_h - ly;
 
         let step = AgentStep {
@@ -106,8 +115,6 @@ where
 
 // ── Screenshot ────────────────────────────────────────────────────────────────
 
-/// Capture main display, resize to logical-point dimensions (1 px = 1 logical pt),
-/// and return (base64-PNG, actual_width, actual_height).
 fn capture_screenshot(logical_w: u32, logical_h: u32) -> Result<(String, u32, u32), String> {
     const PATH: &str = "/tmp/pointer_tour_ss.png";
 
@@ -116,14 +123,11 @@ fn capture_screenshot(logical_w: u32, logical_h: u32) -> Result<(String, u32, u3
         .status()
         .map_err(|e| format!("screencapture: {e}"))?;
 
-    // Resize Retina capture down to logical-point dimensions.
-    // -z height width (may stretch, but for uniform 2x displays aspect is preserved).
     Command::new("sips")
         .args(["-z", &logical_h.to_string(), &logical_w.to_string(), PATH])
         .status()
         .map_err(|e| format!("sips resize: {e}"))?;
 
-    // Query actual output dimensions (sips may round by ±1 px).
     let info = Command::new("sips")
         .args(["-g", "pixelWidth", "-g", "pixelHeight", PATH])
         .output()
@@ -166,7 +170,29 @@ struct StepJson {
     is_final: bool,
 }
 
+/// Retry up to 3 times; accept only in-bounds, non-origin coordinates.
 fn query_groq(
+    goal: &str, app: &str, window: &str, url: Option<&str>,
+    history: &[String], screenshot_b64: &str,
+    img_w: f64, img_h: f64,
+) -> Result<StepJson, String> {
+    for attempt in 0..3u8 {
+        match query_groq_once(goal, app, window, url, history, screenshot_b64, img_w, img_h) {
+            Ok(s) if s.x > 1.0 && s.y > 1.0 && s.x < img_w - 1.0 && s.y < img_h - 1.0 => {
+                return Ok(s);
+            }
+            Ok(s) => eprintln!(
+                "[pointer] attempt {}: suspect coords ({:.0},{:.0}) — retrying",
+                attempt + 1, s.x, s.y
+            ),
+            Err(e) if attempt < 2 => eprintln!("[pointer] attempt {}: {e} — retrying", attempt + 1),
+            Err(e) => return Err(e),
+        }
+    }
+    Err("Could not get valid screen coordinates after 3 attempts".into())
+}
+
+fn query_groq_once(
     goal: &str, app: &str, window: &str, url: Option<&str>,
     history: &[String], screenshot_b64: &str,
     img_w: f64, img_h: f64,
@@ -187,19 +213,18 @@ fn query_groq(
          {url_line}\
          goal:   {goal}\n\
          \n\
-         The attached screenshot is EXACTLY {img_w:.0} px wide × {img_h:.0} px tall.\n\
-         Coordinate origin is the TOP-LEFT corner (0, 0).\n\
-         x increases rightward; y increases DOWNWARD.\n\
+         Screenshot size: {img_w:.0} × {img_h:.0} px  (origin TOP-LEFT, y DOWN)\n\
+         Valid x range: 1 – {:.0}   Valid y range: 1 – {:.0}\n\
          \n\
-         Steps completed so far:\n\
+         Steps done so far:\n\
          {history_text}\n\
          \n\
-         Study the screenshot carefully. Identify the single next UI element \
-         to interact with and return its CENTRE pixel."
+         Identify the single next UI element and return its centre pixel.",
+        img_w - 1.0, img_h - 1.0
     );
 
     let body = serde_json::json!({
-        "model": GROQ_MODEL,
+        "model": groq_model(),
         "messages": [
             { "role": "system", "content": SYSTEM_PROMPT },
             {
@@ -212,15 +237,17 @@ fn query_groq(
                 ]
             }
         ],
-        "temperature": 0.05,
-        "max_tokens": 300
+        "temperature": 0,
+        "max_tokens": 256
     }).to_string();
 
+    let url = groq_url();
+    let key = groq_api_key();
     let out = Command::new("curl")
         .args([
-            "-s", "-X", "POST", GROQ_URL,
+            "-s", "-X", "POST", &url,
             "-H", "Content-Type: application/json",
-            "-H", &format!("Authorization: Bearer {GROQ_API_KEY}"),
+            "-H", &format!("Authorization: Bearer {key}"),
             "-d", &body,
         ])
         .output()
@@ -237,7 +264,7 @@ fn query_groq(
 
     eprintln!("[pointer] AI → {content}");
 
-    // Strip optional ```json ... ``` fences.
+    // Strip optional ```json … ``` fences.
     let json_str = content.trim()
         .trim_start_matches("```json")
         .trim_start_matches("```")
@@ -250,26 +277,21 @@ fn query_groq(
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT: &str = r#"You are a precise GUI tour-guide that walks users step by step.
+const SYSTEM_PROMPT: &str = r#"You are a macOS GUI tour-guide. Each turn you receive a screenshot and must identify the single next UI element the user should interact with.
 
-Context fields you receive:
-  app:    active application name
-  window: window title
-  url:    (browsers only) full URL — use this to understand the page
-  goal:   what the user wants to accomplish
+COORDINATE SYSTEM
+  • Origin (0,0) = TOP-LEFT corner of the image.
+  • x increases rightward; y increases DOWNWARD.
+  • The image dimensions and valid coordinate ranges are stated in the user message.
+  • Return the CENTRE pixel of the target element.
+  • x and y must both be strictly within the stated valid ranges.
 
-Screenshot rules:
-  • The image pixel dimensions are stated exactly in the message.
-  • Top-left = (0, 0).  x → right,  y → DOWN.
-  • Return the CENTRE pixel of the exact element to interact with.
-  • Look at every visible element carefully — do NOT guess or hallucinate positions.
-  • When url is given, use it to understand the page layout precisely.
+HOW TO RESPOND
+  1. Read the goal and steps already completed.
+  2. Determine what the next action must be.
+  3. Find that exact element in the screenshot — look at its actual pixel position.
+  4. Before writing coordinates, mentally verify: is the element visible? Are x and y inside bounds?
+  5. Write descriptions in plain English for non-technical users (e.g. "Click the blue Sign In button near the top right").
 
-Output a raw JSON object ONLY — no markdown, no prose:
-{
-  "x": <integer pixel x>,
-  "y": <integer pixel y>,
-  "action": "<Click | Type | Double-click | Right-click | Scroll | Hover>",
-  "description": "<one clear sentence telling the user what to do, e.g. 'Click the green Code button'>",
-  "is_final": <true if this action completes the entire goal, else false>
-}"#;
+OUTPUT — raw JSON only, no markdown, no explanation:
+{"x":<int>,"y":<int>,"action":"<Click|Type|Double-click|Right-click|Scroll|Hover>","description":"<one sentence>","is_final":<true|false>}"#;

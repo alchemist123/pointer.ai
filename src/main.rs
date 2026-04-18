@@ -19,15 +19,15 @@ use std::thread;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const DOT_SZ:  f64 = 44.0;
-const IN_W:    f64 = 260.0;
-const IN_H:    f64 = 72.0;
-const STEP_W:  f64 = 310.0;
+const DOT_SZ:  f64 = 40.0;
+const IN_W:    f64 = 360.0;
+const IN_H:    f64 = 52.0;
+const STEP_W:  f64 = 320.0;
 const STEP_H:  f64 = 172.0;
-const HINT_W:  f64 = 148.0;
+const HINT_W:  f64 = 168.0;
 const HINT_H:  f64 = 26.0;
-const CLRP_W:  f64 = 216.0;
-const CLRP_H:  f64 = 72.0;
+const SETT_W:  f64 = 200.0;
+const SETT_H:  f64 = 116.0;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 // 0 = hidden
@@ -78,11 +78,12 @@ static ANIM_TICK:        AtomicU32 = AtomicU32::new(0);
 static COMPLETE_COUNTDOWN: AtomicI32 = AtomicI32::new(-1);
 static GOAL_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
 
-// Action hint pill near dot + colour picker
-static DOT_COLOR:     AtomicU8  = AtomicU8::new(0); // 0=blue 1=red 2=green 3=orange 4=purple
-static HINT_WIN_PTR:  OnceLock<usize> = OnceLock::new();
-static HINT_LBL_PTR:  OnceLock<usize> = OnceLock::new();
-static COLOR_WIN_PTR: OnceLock<usize> = OnceLock::new();
+// Action hint pill + colour picker
+static DOT_COLOR:      AtomicU8  = AtomicU8::new(0); // 0-7 see dot_color_rgb
+static HINT_WIN_PTR:     OnceLock<usize>    = OnceLock::new();
+static HINT_LBL_PTR:     OnceLock<usize>    = OnceLock::new();
+static SETTINGS_WIN_PTR: OnceLock<usize>    = OnceLock::new();
+static SETT_BTN_PTRS:    OnceLock<[usize;8]> = OnceLock::new();
 
 // ── Accessors ─────────────────────────────────────────────────────────────────
 
@@ -94,7 +95,7 @@ static COLOR_WIN_PTR: OnceLock<usize> = OnceLock::new();
 #[inline] unsafe fn placeholder()   -> id { *PLACEHOLDER_PTR.get().unwrap()   as id }
 #[inline] unsafe fn step_win()      -> id { *STEP_WIN_PTR.get().unwrap()      as id }
 #[inline] unsafe fn hint_win()      -> id { *HINT_WIN_PTR.get().unwrap()       as id }
-#[inline] unsafe fn color_win()     -> id { *COLOR_WIN_PTR.get().unwrap()      as id }
+#[inline] unsafe fn settings_win()  -> id { *SETTINGS_WIN_PTR.get().unwrap()   as id }
 
 fn dot_color_rgb() -> (f64, f64, f64) {
     match DOT_COLOR.load(Ordering::SeqCst) {
@@ -102,8 +103,17 @@ fn dot_color_rgb() -> (f64, f64, f64) {
         2 => (0.12, 0.75, 0.30), // green
         3 => (1.00, 0.55, 0.05), // orange
         4 => (0.65, 0.20, 0.90), // purple
+        5 => (1.00, 0.25, 0.60), // pink
+        6 => (0.00, 0.75, 0.75), // teal
+        7 => (0.95, 0.80, 0.00), // yellow
         _ => (0.10, 0.50, 1.00), // blue (default)
     }
+}
+
+unsafe fn force_dark(view: id) {
+    let name: id = NSString::alloc(nil).init_str("NSAppearanceNameDarkAqua");
+    let dark: id = msg_send![class!(NSAppearance), appearanceNamed: name];
+    let _: () = msg_send![view, setAppearance: dark];
 }
 
 #[inline] unsafe fn redraw_dot() {
@@ -200,8 +210,8 @@ unsafe fn to_hidden_impl() {
     let _: () = msg_send![dot_win(),  orderOut: nil as id];
     let _: () = msg_send![in_panel(), orderOut: nil as id];
     let _: () = msg_send![step_win(), orderOut: nil as id];
-    if HINT_WIN_PTR.get().is_some() { let _: () = msg_send![hint_win(),  orderOut: nil as id]; }
-    if COLOR_WIN_PTR.get().is_some(){ let _: () = msg_send![color_win(), orderOut: nil as id]; }
+    if HINT_WIN_PTR.get().is_some()     { let _: () = msg_send![hint_win(),     orderOut: nil as id]; }
+    if SETTINGS_WIN_PTR.get().is_some() { let _: () = msg_send![settings_win(), orderOut: nil as id]; }
     let _: () = msg_send![dot_win(),  setIgnoresMouseEvents: NO];
     if let Some(m) = INPUT_TEXT.get()  { if let Ok(mut g) = m.lock() { g.clear(); } }
     if let Some(m) = TOUR_AGENT.get()  { if let Ok(mut g) = m.lock() { *g = None; } }
@@ -626,110 +636,92 @@ unsafe fn build_input_panel(ctrl: id) -> id {
     let _: () = msg_send![panel, setCollectionBehavior: 1u64];
     let _: () = msg_send![panel, setHidesOnDeactivate: NO];
 
+    // NSVisualEffectMaterial.popover (6) — the same blur used by macOS popovers
     let ve: id = msg_send![class!(NSVisualEffectView), alloc];
     let ve: id = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(IN_W,IN_H))];
-    let _: () = msg_send![ve, setMaterial: 13_i64];
+    let _: () = msg_send![ve, setMaterial: 6_i64];
     let _: () = msg_send![ve, setBlendingMode: 0_i64];
     let _: () = msg_send![ve, setState: 1_i64];
     let _: () = msg_send![ve, setWantsLayer: YES];
     let vel: id = msg_send![ve, layer];
-    let _: () = msg_send![vel, setCornerRadius: 12.0_f64];
+    let _: () = msg_send![vel, setCornerRadius: 14.0_f64];
     let _: () = msg_send![vel, setMasksToBounds: YES];
     let _: () = msg_send![panel, setContentView: ve];
+    force_dark(ve);
 
-    // Drag strip
-    let grip: id = msg_send![class!(NSTextField), alloc];
-    let grip: id = msg_send![grip, initWithFrame: NSRect::new(NSPoint::new(0.0, IN_H-16.0), NSSize::new(IN_W, 16.0))];
-    let _: () = msg_send![grip, setEditable: NO]; let _: () = msg_send![grip, setBezeled: NO];
-    let _: () = msg_send![grip, setDrawsBackground: NO]; let _: () = msg_send![grip, setSelectable: NO];
-    let _: () = msg_send![grip, setAlignment: 2_i64];
-    let _: () = msg_send![grip, setStringValue: NSString::alloc(nil).init_str("⋯")];
-    let gf: id = msg_send![class!(NSFont), systemFontOfSize: 10.0_f64];
-    let _: () = msg_send![grip, setFont: gf];
-    let gc: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.25_f64];
-    let _: () = msg_send![grip, setTextColor: gc];
-    let _: () = msg_send![ve, addSubview: grip];
-
-    // Gear / settings button in the top-right of the drag strip
-    let gear: id = msg_send![class!(NSButton), alloc];
-    let gear: id = msg_send![gear,
-        initWithFrame: NSRect::new(NSPoint::new(IN_W-20.0, IN_H-16.0), NSSize::new(18.0, 16.0))
-    ];
-    let _: () = msg_send![gear, setBezelStyle: 0_i64];
-    let _: () = msg_send![gear, setBordered: NO];
-    let _: () = msg_send![gear, setTitle: NSString::alloc(nil).init_str("⚙")];
-    let gear_font: id = msg_send![class!(NSFont), systemFontOfSize: 11.0_f64];
-    let _: () = msg_send![gear, setFont: gear_font];
-    let gear_col: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.45_f64];
-    let _: () = msg_send![gear, setContentTintColor: gear_col];
-    let _: () = msg_send![gear, setAction: sel!(showColorPanel:)];
-    let _: () = msg_send![gear, setTarget: ctrl];
-    let _: () = msg_send![ve, addSubview: gear];
-
-    // Text input box
-    let ch = IN_H - 16.0;
-    let bh = 32.0_f64;
-    let by = (ch - bh) / 2.0;
-    let bw = IN_W - 56.0;
-    let box_: id = msg_send![class!(NSView), alloc];
-    let box_: id = msg_send![box_, initWithFrame: NSRect::new(NSPoint::new(10.0, by), NSSize::new(bw+4.0, bh))];
-    let _: () = msg_send![box_, setWantsLayer: YES];
-    let bl: id = msg_send![box_, layer];
-    let fill: id = msg_send![class!(NSColor), colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.30_f64];
-    let cg_fill: id = msg_send![fill, CGColor];
-    let _: () = msg_send![bl, setBackgroundColor: cg_fill];
-    let _: () = msg_send![bl, setCornerRadius: 7.0_f64];
-    let bord: id = msg_send![class!(NSColor), colorWithRed:0.25 green:0.60 blue:1.00 alpha:0.80_f64];
-    let cg_bord: id = msg_send![bord, CGColor];
-    let _: () = msg_send![bl, setBorderColor: cg_bord];
-    let _: () = msg_send![bl, setBorderWidth: 1.5_f64];
-    let _: () = msg_send![ve, addSubview: box_];
-
+    let cy   = IN_H / 2.0;
     let white: id = msg_send![class!(NSColor), whiteColor];
 
+    // ── Layout (all x from left edge) ─────────────────────────────────────────
+    // [14]  text display (262 wide)  [8]  gear(28)  [6]  submit(32)  [10]
+    let sub_w  = 32.0_f64;
+    let sub_x  = IN_W - 10.0 - sub_w;          // 318
+    let gear_w = 28.0_f64;
+    let gear_x = sub_x - 6.0 - gear_w;         // 284
+    let txt_x  = 14.0_f64;
+    let txt_w  = gear_x - 8.0 - txt_x;         // 262
+
     // Display label
+    let th = 22.0_f64;
+    let ty = cy - th / 2.0;
     let df: id = msg_send![class!(NSTextField), alloc];
-    let df: id = msg_send![df, initWithFrame: NSRect::new(NSPoint::new(8.0, 4.0), NSSize::new(bw-12.0, bh-8.0))];
+    let df: id = msg_send![df, initWithFrame: NSRect::new(NSPoint::new(txt_x, ty), NSSize::new(txt_w, th))];
     let _: () = msg_send![df, setEditable: NO]; let _: () = msg_send![df, setSelectable: NO];
-    let _: () = msg_send![df, setBezeled: NO]; let _: () = msg_send![df, setDrawsBackground: NO];
-    let df_font: id = msg_send![class!(NSFont), systemFontOfSize: 14.0_f64];
+    let _: () = msg_send![df, setBezeled: NO];  let _: () = msg_send![df, setDrawsBackground: NO];
+    let df_font: id = msg_send![class!(NSFont), systemFontOfSize: 16.0_f64];
     let _: () = msg_send![df, setFont: df_font];
     let _: () = msg_send![df, setTextColor: white];
     let _: () = msg_send![df, setStringValue: NSString::alloc(nil).init_str("")];
-    let _: () = msg_send![box_, addSubview: df];
+    let _: () = msg_send![ve, addSubview: df];
 
     // Placeholder
     let ph: id = msg_send![class!(NSTextField), alloc];
-    let ph: id = msg_send![ph, initWithFrame: NSRect::new(NSPoint::new(8.0, 4.0), NSSize::new(bw-12.0, bh-8.0))];
+    let ph: id = msg_send![ph, initWithFrame: NSRect::new(NSPoint::new(txt_x, ty), NSSize::new(txt_w, th))];
     let _: () = msg_send![ph, setEditable: NO]; let _: () = msg_send![ph, setBezeled: NO];
     let _: () = msg_send![ph, setDrawsBackground: NO]; let _: () = msg_send![ph, setSelectable: NO];
-    let ph_font: id = msg_send![class!(NSFont), systemFontOfSize: 14.0_f64];
+    let ph_font: id = msg_send![class!(NSFont), systemFontOfSize: 16.0_f64];
     let _: () = msg_send![ph, setFont: ph_font];
-    let phc: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.30_f64];
+    let phc: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.28_f64];
     let _: () = msg_send![ph, setTextColor: phc];
-    let _: () = msg_send![ph, setStringValue: NSString::alloc(nil).init_str("Ask anything…")];
-    let _: () = msg_send![box_, addSubview: ph];
+    let _: () = msg_send![ph, setStringValue: NSString::alloc(nil).init_str("What do you want to do?")];
+    let _: () = msg_send![ve, addSubview: ph];
 
-    // InputView (key capture)
+    // InputView (key capture) — same region as text display
     let iv_cls = register_input_view();
     let iv: id = msg_send![iv_cls, alloc];
-    let iv: id = msg_send![iv, initWithFrame: NSRect::new(NSPoint::new(10.0, by), NSSize::new(bw+4.0, bh))];
+    let iv: id = msg_send![iv, initWithFrame: NSRect::new(NSPoint::new(txt_x, 0.0), NSSize::new(txt_w, IN_H))];
     let _: () = msg_send![ve, addSubview: iv];
 
-    // Submit button
-    let bs = 34.0_f64;
+    // ⚙ Gear button — icon-only, no background circle
+    let gear_btn: id = msg_send![class!(NSButton), alloc];
+    let gear_btn: id = msg_send![gear_btn,
+        initWithFrame: NSRect::new(NSPoint::new(gear_x, cy - gear_w/2.0), NSSize::new(gear_w, gear_w))
+    ];
+    let _: () = msg_send![gear_btn, setBezelStyle: 0_i64];
+    let _: () = msg_send![gear_btn, setBordered: NO];
+    let _: () = msg_send![gear_btn, setTitle: NSString::alloc(nil).init_str("⚙")];
+    let gear_font: id = msg_send![class!(NSFont), systemFontOfSize: 17.0_f64];
+    let _: () = msg_send![gear_btn, setFont: gear_font];
+    let gear_c: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.50_f64];
+    let _: () = msg_send![gear_btn, setContentTintColor: gear_c];
+    let _: () = msg_send![gear_btn, setAction: sel!(toggleSettings:)];
+    let _: () = msg_send![gear_btn, setTarget: ctrl];
+    let _: () = msg_send![ve, addSubview: gear_btn];
+
+    // Submit button — blue circle with return arrow
     let btn: id = msg_send![class!(NSButton), alloc];
-    let btn: id = msg_send![btn, initWithFrame: NSRect::new(
-        NSPoint::new(IN_W - bs - 10.0, (ch - bs) / 2.0), NSSize::new(bs, bs))];
+    let btn: id = msg_send![btn,
+        initWithFrame: NSRect::new(NSPoint::new(sub_x, cy - sub_w/2.0), NSSize::new(sub_w, sub_w))
+    ];
     let _: () = msg_send![btn, setBezelStyle: 0_i64]; let _: () = msg_send![btn, setBordered: NO];
     let _: () = msg_send![btn, setWantsLayer: YES];
     let btnl: id = msg_send![btn, layer];
     let blue: id = msg_send![class!(NSColor), colorWithRed:0.07 green:0.47 blue:1.0 alpha:1.0_f64];
     let cg_blue: id = msg_send![blue, CGColor];
     let _: () = msg_send![btnl, setBackgroundColor: cg_blue];
-    let _: () = msg_send![btnl, setCornerRadius: bs/2.0];
+    let _: () = msg_send![btnl, setCornerRadius: sub_w / 2.0];
     let _: () = msg_send![btn, setTitle: NSString::alloc(nil).init_str("\u{21A9}")];
-    let btn_font: id = msg_send![class!(NSFont), systemFontOfSize: 16.0_f64];
+    let btn_font: id = msg_send![class!(NSFont), systemFontOfSize: 15.0_f64];
     let _: () = msg_send![btn, setFont: btn_font];
     let _: () = msg_send![btn, setContentTintColor: white];
     let _: () = msg_send![btn, setAction: sel!(enterPressed:)];
@@ -744,19 +736,15 @@ unsafe fn build_input_panel(ctrl: id) -> id {
 
 // ── Step panel ────────────────────────────────────────────────────────────────
 //
-// Layout (NS coords, y=0 at bottom, STEP_H=172):
-//
 //  172 ┌──────────────────────────────────────┐
-//      │  STEP N  ·  ACTION  (small header)   │  y=154, h=16
-//  154 ├──────────────────────────────────────┤  sep y=152
+//      │  Step N · ACTION          (11pt dim) │  y=150, h=18
+//  150 │ ─────────────────────────────────── │  sep y=148
 //      │                                      │
-//      │  Full instruction text here          │  y=64, h=86 (6 lines @ 13pt)
-//      │  wrapping across multiple lines      │
+//      │  Full instruction (14pt white, wrap) │  y=56, h=88
 //      │                                      │
-//   64 ├──────────────────────────────────────┤  sep y=62
-//      │                                      │
-//   10 │  [   I did it  →   /  Done ✓   ]     │  y=10, h=46
-//    0 └──────────────────────────────────────┘
+//   56 │ ─────────────────────────────────── │  sep y=54
+//      │  [ I did it →  ]                    │  y=10, h=40
+//  ────┘
 
 unsafe fn build_step_panel(ctrl: id) -> id {
     let panel: id = msg_send![class!(NSPanel), alloc];
@@ -774,9 +762,10 @@ unsafe fn build_step_panel(ctrl: id) -> id {
     let _: () = msg_send![panel, setCollectionBehavior: 1u64];
     let _: () = msg_send![panel, setHidesOnDeactivate: NO];
 
+    // NSVisualEffectMaterial.popover (6)
     let ve: id = msg_send![class!(NSVisualEffectView), alloc];
     let ve: id = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(STEP_W, STEP_H))];
-    let _: () = msg_send![ve, setMaterial: 13_i64];
+    let _: () = msg_send![ve, setMaterial: 6_i64];
     let _: () = msg_send![ve, setBlendingMode: 0_i64];
     let _: () = msg_send![ve, setState: 1_i64];
     let _: () = msg_send![ve, setWantsLayer: YES];
@@ -784,9 +773,12 @@ unsafe fn build_step_panel(ctrl: id) -> id {
     let _: () = msg_send![vel, setCornerRadius: 14.0_f64];
     let _: () = msg_send![vel, setMasksToBounds: YES];
     let _: () = msg_send![panel, setContentView: ve];
+    force_dark(ve);
 
+    let pad  = 16.0_f64;
+    let cw   = STEP_W - pad * 2.0;  // content width
     let white: id = msg_send![class!(NSColor), whiteColor];
-    let dim:   id = msg_send![class!(NSColor), colorWithRed:1.0_f64 green:1.0_f64 blue:1.0_f64 alpha:0.55_f64];
+    let dim:   id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.50_f64];
 
     let make_lbl = |frame: NSRect, font: id, color: id, text: &str| -> id {
         let f: id = msg_send![class!(NSTextField), alloc];
@@ -798,57 +790,53 @@ unsafe fn build_step_panel(ctrl: id) -> id {
         f
     };
 
-    // Header: "STEP N · ACTION"
+    let make_sep = |y: f64| -> id {
+        let s: id = msg_send![class!(NSView), alloc];
+        let s: id = msg_send![s, initWithFrame: NSRect::new(NSPoint::new(pad, y), NSSize::new(cw, 1.0))];
+        let _: () = msg_send![s, setWantsLayer: YES];
+        let sl: id = msg_send![s, layer];
+        let c: id  = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.12_f64];
+        let cg: id = msg_send![c, CGColor];
+        let _: () = msg_send![sl, setBackgroundColor: cg];
+        s
+    };
+
+    // Header: "Step N · ACTION"
     let head_font: id = msg_send![class!(NSFont), systemFontOfSize: 11.0_f64];
     let head = make_lbl(
-        NSRect::new(NSPoint::new(16.0, 154.0), NSSize::new(STEP_W - 32.0, 16.0)),
+        NSRect::new(NSPoint::new(pad, 150.0), NSSize::new(cw, 18.0)),
         head_font, dim, "",
     );
     let _: () = msg_send![ve, addSubview: head];
+    let _: () = msg_send![ve, addSubview: make_sep(148.0)];
 
-    // Separator below header
-    let sep1: id = msg_send![class!(NSBox), alloc];
-    let sep1: id = msg_send![sep1,
-        initWithFrame: NSRect::new(NSPoint::new(16.0, 152.0), NSSize::new(STEP_W - 32.0, 1.0))
-    ];
-    let _: () = msg_send![sep1, setBoxType: 2_i64];
-    let _: () = msg_send![ve, addSubview: sep1];
-
-    // Body: main instruction text (large, word-wrapped)
+    // Body
     let body_font: id = msg_send![class!(NSFont), systemFontOfSize: 14.0_f64];
     let body = make_lbl(
-        NSRect::new(NSPoint::new(16.0, 64.0), NSSize::new(STEP_W - 32.0, 86.0)),
+        NSRect::new(NSPoint::new(pad, 56.0), NSSize::new(cw, 88.0)),
         body_font, white, "",
     );
-    let _: () = msg_send![body, setLineBreakMode: 6_i64]; // NSLineBreakByWordWrapping
+    let _: () = msg_send![body, setLineBreakMode: 6_i64];
     let _: () = msg_send![body, setMaximumNumberOfLines: 5_i64];
     let body_cell: id = msg_send![body, cell];
     let _: () = msg_send![body_cell, setWraps: YES];
     let _: () = msg_send![body_cell, setScrollable: NO];
     let _: () = msg_send![ve, addSubview: body];
-
-    // Separator above button
-    let sep2: id = msg_send![class!(NSBox), alloc];
-    let sep2: id = msg_send![sep2,
-        initWithFrame: NSRect::new(NSPoint::new(16.0, 62.0), NSSize::new(STEP_W - 32.0, 1.0))
-    ];
-    let _: () = msg_send![sep2, setBoxType: 2_i64];
-    let _: () = msg_send![ve, addSubview: sep2];
+    let _: () = msg_send![ve, addSubview: make_sep(54.0)];
 
     // "I did it →" button
-    let bw = STEP_W - 32.0;
     let next_btn: id = msg_send![class!(NSButton), alloc];
     let next_btn: id = msg_send![next_btn,
-        initWithFrame: NSRect::new(NSPoint::new(16.0, 10.0), NSSize::new(bw, 46.0))
+        initWithFrame: NSRect::new(NSPoint::new(pad, 10.0), NSSize::new(cw, 40.0))
     ];
     let _: () = msg_send![next_btn, setBezelStyle: 0_i64];
     let _: () = msg_send![next_btn, setBordered: NO];
     let _: () = msg_send![next_btn, setWantsLayer: YES];
     let btnl: id = msg_send![next_btn, layer];
     let blue: id = msg_send![class!(NSColor), colorWithRed:0.07 green:0.47 blue:1.0 alpha:1.0_f64];
-    let cg_blue2: id = msg_send![blue, CGColor];
-    let _: () = msg_send![btnl, setBackgroundColor: cg_blue2];
-    let _: () = msg_send![btnl, setCornerRadius: 12.0_f64];
+    let cg_blue: id = msg_send![blue, CGColor];
+    let _: () = msg_send![btnl, setBackgroundColor: cg_blue];
+    let _: () = msg_send![btnl, setCornerRadius: 10.0_f64];
     let _: () = msg_send![next_btn, setTitle: NSString::alloc(nil).init_str("I did it  \u{2192}")];
     let btnf: id = msg_send![class!(NSFont), boldSystemFontOfSize: 14.0_f64];
     let _: () = msg_send![next_btn, setFont: btnf];
@@ -891,26 +879,29 @@ unsafe fn build_hint_panel() -> id {
     let clear: id = msg_send![class!(NSColor), clearColor];
     let _: () = msg_send![panel, setBackgroundColor: clear];
     let _: () = msg_send![panel, setLevel: 25_i64];
-    let _: () = msg_send![panel, setHasShadow: NO];
+    let _: () = msg_send![panel, setHasShadow: YES];
     let _: () = msg_send![panel, setIgnoresMouseEvents: YES];
     let _: () = msg_send![panel, setCollectionBehavior: 1u64];
     let _: () = msg_send![panel, setHidesOnDeactivate: NO];
 
-    let bg: id = msg_send![class!(NSView), alloc];
-    let bg: id = msg_send![bg,
+    // NSVisualEffectView gives reliable dark frosted-glass rendering + proper corner clipping
+    let ve: id = msg_send![class!(NSVisualEffectView), alloc];
+    let ve: id = msg_send![ve,
         initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(HINT_W, HINT_H))
     ];
-    let _: () = msg_send![bg, setWantsLayer: YES];
-    let bgl: id = msg_send![bg, layer];
-    let bgc: id = msg_send![class!(NSColor), colorWithRed:0.07 green:0.07 blue:0.09 alpha:0.84_f64];
-    let cg_bgc: id = msg_send![bgc, CGColor];
-    let _: () = msg_send![bgl, setBackgroundColor: cg_bgc];
-    let _: () = msg_send![bgl, setCornerRadius: HINT_H/2.0];
-    let _: () = msg_send![panel, setContentView: bg];
+    let _: () = msg_send![ve, setMaterial: 17_i64]; // NSVisualEffectMaterialToolTip
+    let _: () = msg_send![ve, setBlendingMode: 0_i64];
+    let _: () = msg_send![ve, setState: 1_i64];
+    let _: () = msg_send![ve, setWantsLayer: YES];
+    let vel: id = msg_send![ve, layer];
+    let _: () = msg_send![vel, setCornerRadius: HINT_H / 2.0];
+    let _: () = msg_send![vel, setMasksToBounds: YES];
+    let _: () = msg_send![panel, setContentView: ve];
+    force_dark(ve);
 
     let lbl: id = msg_send![class!(NSTextField), alloc];
     let lbl: id = msg_send![lbl,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 1.0), NSSize::new(HINT_W, HINT_H-2.0))
+        initWithFrame: NSRect::new(NSPoint::new(4.0, 1.0), NSSize::new(HINT_W - 8.0, HINT_H - 2.0))
     ];
     let _: () = msg_send![lbl, setEditable: NO]; let _: () = msg_send![lbl, setBezeled: NO];
     let _: () = msg_send![lbl, setDrawsBackground: NO]; let _: () = msg_send![lbl, setSelectable: NO];
@@ -919,18 +910,19 @@ unsafe fn build_hint_panel() -> id {
     let _: () = msg_send![lbl, setFont: lf];
     let wc: id = msg_send![class!(NSColor), whiteColor];
     let _: () = msg_send![lbl, setTextColor: wc];
-    let _: () = msg_send![bg, addSubview: lbl];
+    let _: () = msg_send![ve, addSubview: lbl];
 
     HINT_LBL_PTR.set(lbl as usize).unwrap();
     panel
 }
 
-// ── Pointer colour picker ─────────────────────────────────────────────────────
 
-unsafe fn build_color_panel(ctrl: id) -> id {
+// ── Settings / colour picker dropdown ────────────────────────────────────────
+
+unsafe fn build_settings_panel(ctrl: id) -> id {
     let panel: id = msg_send![class!(NSPanel), alloc];
     let panel: id = msg_send![panel,
-        initWithContentRect: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(CLRP_W, CLRP_H))
+        initWithContentRect: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(SETT_W, SETT_H))
         styleMask: 0u64 backing: 2u64 defer: NO
     ];
     let _: () = msg_send![panel, setOpaque: NO];
@@ -941,11 +933,12 @@ unsafe fn build_color_panel(ctrl: id) -> id {
     let _: () = msg_send![panel, setCollectionBehavior: 1u64];
     let _: () = msg_send![panel, setHidesOnDeactivate: NO];
 
+    // NSVisualEffectMaterial.popover (6) — same material as input/step panels
     let ve: id = msg_send![class!(NSVisualEffectView), alloc];
     let ve: id = msg_send![ve,
-        initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(CLRP_W, CLRP_H))
+        initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(SETT_W, SETT_H))
     ];
-    let _: () = msg_send![ve, setMaterial: 13_i64];
+    let _: () = msg_send![ve, setMaterial: 6_i64];
     let _: () = msg_send![ve, setBlendingMode: 0_i64];
     let _: () = msg_send![ve, setState: 1_i64];
     let _: () = msg_send![ve, setWantsLayer: YES];
@@ -953,55 +946,76 @@ unsafe fn build_color_panel(ctrl: id) -> id {
     let _: () = msg_send![vel, setCornerRadius: 12.0_f64];
     let _: () = msg_send![vel, setMasksToBounds: YES];
     let _: () = msg_send![panel, setContentView: ve];
+    force_dark(ve);
 
-    // Header
+    // "Pointer Colour" header label
     let hdr: id = msg_send![class!(NSTextField), alloc];
     let hdr: id = msg_send![hdr,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, CLRP_H-22.0), NSSize::new(CLRP_W, 18.0))
+        initWithFrame: NSRect::new(NSPoint::new(0.0, SETT_H - 26.0), NSSize::new(SETT_W, 18.0))
     ];
     let _: () = msg_send![hdr, setEditable: NO]; let _: () = msg_send![hdr, setBezeled: NO];
     let _: () = msg_send![hdr, setDrawsBackground: NO]; let _: () = msg_send![hdr, setSelectable: NO];
     let _: () = msg_send![hdr, setAlignment: 2_i64];
-    let hf: id = msg_send![class!(NSFont), systemFontOfSize: 11.0_f64];
+    let hf: id = msg_send![class!(NSFont), boldSystemFontOfSize: 11.0_f64];
     let _: () = msg_send![hdr, setFont: hf];
-    let dimc: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.55_f64];
-    let _: () = msg_send![hdr, setTextColor: dimc];
-    let _: () = msg_send![hdr, setStringValue: NSString::alloc(nil).init_str("Pointer colour")];
+    let dc: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.55_f64];
+    let _: () = msg_send![hdr, setTextColor: dc];
+    let _: () = msg_send![hdr, setStringValue: NSString::alloc(nil).init_str("Pointer Colour")];
     let _: () = msg_send![ve, addSubview: hdr];
 
-    // Five colour swatches
-    let swatches: [(f64, f64, f64); 5] = [
+    // 8 colour swatches in two rows of 4
+    let colors: [(f64, f64, f64); 8] = [
         (0.10, 0.50, 1.00), // blue
         (1.00, 0.22, 0.15), // red
         (0.12, 0.75, 0.30), // green
         (1.00, 0.55, 0.05), // orange
         (0.65, 0.20, 0.90), // purple
+        (1.00, 0.25, 0.60), // pink
+        (0.00, 0.75, 0.75), // teal
+        (0.95, 0.80, 0.00), // yellow
     ];
-    let sz  = 30.0_f64;
-    let gap = 8.0_f64;
-    let row_w = swatches.len() as f64 * sz + (swatches.len()-1) as f64 * gap;
-    let sx0 = (CLRP_W - row_w) / 2.0;
-    let sy  = (CLRP_H - 22.0 - sz) / 2.0;
-    for (i, &(r, g, b)) in swatches.iter().enumerate() {
-        let sx = sx0 + i as f64 * (sz + gap);
+    let sz  = 28.0_f64;
+    let gap = 12.0_f64;
+    let cols = 4_usize;
+    let row_w = cols as f64 * sz + (cols - 1) as f64 * gap;
+    let x0    = (SETT_W - row_w) / 2.0;
+    let row1_y = SETT_H - 30.0 - sz;
+    let row2_y = row1_y - gap - sz;
+    let cur   = DOT_COLOR.load(std::sync::atomic::Ordering::SeqCst) as usize;
+
+    let mut btn_ptrs = [0usize; 8];
+    for (i, &(r, g, b)) in colors.iter().enumerate() {
+        let col_idx = i % cols;
+        let row_y   = if i < cols { row1_y } else { row2_y };
+        let sx = x0 + col_idx as f64 * (sz + gap);
+
         let btn: id = msg_send![class!(NSButton), alloc];
         let btn: id = msg_send![btn,
-            initWithFrame: NSRect::new(NSPoint::new(sx, sy), NSSize::new(sz, sz))
+            initWithFrame: NSRect::new(NSPoint::new(sx, row_y), NSSize::new(sz, sz))
         ];
         let _: () = msg_send![btn, setBezelStyle: 0_i64];
         let _: () = msg_send![btn, setBordered: NO];
         let _: () = msg_send![btn, setWantsLayer: YES];
         let bl: id = msg_send![btn, layer];
         let col: id = msg_send![class!(NSColor), colorWithRed:r green:g blue:b alpha:1.0_f64];
-        let cg:  id = msg_send![col, CGColor];
+        let cg: id  = msg_send![col, CGColor];
         let _: () = msg_send![bl, setBackgroundColor: cg];
-        let _: () = msg_send![bl, setCornerRadius: sz/2.0];
+        let _: () = msg_send![bl, setCornerRadius: sz / 2.0];
+        // White ring on currently selected colour
+        if i == cur {
+            let wh: id = msg_send![class!(NSColor), whiteColor];
+            let wc: id = msg_send![wh, CGColor];
+            let _: () = msg_send![bl, setBorderColor: wc];
+            let _: () = msg_send![bl, setBorderWidth: 2.5_f64];
+        }
         let _: () = msg_send![btn, setTitle: NSString::alloc(nil).init_str("")];
         let _: () = msg_send![btn, setTag: i as i64];
         let _: () = msg_send![btn, setAction: sel!(colorSelected:)];
         let _: () = msg_send![btn, setTarget: ctrl];
         let _: () = msg_send![ve, addSubview: btn];
+        btn_ptrs[i] = btn as usize;
     }
+    SETT_BTN_PTRS.set(btn_ptrs).ok(); // ok() — ignore if already set (shouldn't happen)
     panel
 }
 
@@ -1222,40 +1236,61 @@ fn main() {
             dispatch::Queue::main().exec_async(on_next_step_pressed);
         }
 
-        extern "C" fn show_color_panel(_: &Object, _: Sel, _: id) {
-            unsafe {
-                let cp: id = color_win();
-                // Position above the input panel
-                let ip_f: NSRect = msg_send![in_panel(), frame];
-                let px = ip_f.origin.x + (IN_W - CLRP_W) / 2.0;
-                let py = ip_f.origin.y + IN_H + 6.0;
-                let _: () = msg_send![cp,
-                    setFrame: NSRect::new(NSPoint::new(px, py), NSSize::new(CLRP_W, CLRP_H))
-                    display: YES
-                ];
-                let visible: BOOL = msg_send![cp, isVisible];
-                if visible == YES {
-                    let _: () = msg_send![cp, orderOut: nil as id];
-                } else {
-                    let _: () = msg_send![cp, orderFrontRegardless];
-                }
-            }
-        }
-
         extern "C" fn color_selected(_: &Object, _: Sel, sender: id) {
             unsafe {
                 let tag: i64 = msg_send![sender, tag];
                 DOT_COLOR.store(tag as u8, Ordering::SeqCst);
-                let _: () = msg_send![color_win(), orderOut: nil as id];
+                // Update selection ring on all swatches
+                if let Some(ptrs) = SETT_BTN_PTRS.get() {
+                    for (i, &ptr) in ptrs.iter().enumerate() {
+                        let btn: id = ptr as id;
+                        let layer: id = msg_send![btn, layer];
+                        if i == tag as usize {
+                            let wh: id = msg_send![class!(NSColor), whiteColor];
+                            let wc: id = msg_send![wh, CGColor];
+                            let _: () = msg_send![layer, setBorderColor: wc];
+                            let _: () = msg_send![layer, setBorderWidth: 2.5_f64];
+                        } else {
+                            let _: () = msg_send![layer, setBorderWidth: 0.0_f64];
+                        }
+                    }
+                }
                 redraw_dot();
+                if SETTINGS_WIN_PTR.get().is_some() {
+                    let _: () = msg_send![settings_win(), orderOut: nil as id];
+                }
+            }
+        }
+
+        extern "C" fn toggle_settings(_: &Object, _: Sel, _: id) {
+            unsafe {
+                if SETTINGS_WIN_PTR.get().is_none() { return; }
+                let sw: id = settings_win();
+                let visible: BOOL = msg_send![sw, isVisible];
+                if visible == YES {
+                    let _: () = msg_send![sw, orderOut: nil as id];
+                } else {
+                    let ip_f: NSRect = msg_send![in_panel(), frame];
+                    let px = ip_f.origin.x + (IN_W - SETT_W) / 2.0;
+                    let py_above = ip_f.origin.y + IN_H + 6.0;
+                    let py_below = ip_f.origin.y - SETT_H - 6.0;
+                    let screen: id = msg_send![class!(NSScreen), mainScreen];
+                    let sf: NSRect = msg_send![screen, frame];
+                    let py = if py_above + SETT_H < sf.size.height { py_above } else { py_below.max(0.0) };
+                    let _: () = msg_send![sw,
+                        setFrame: NSRect::new(NSPoint::new(px, py), NSSize::new(SETT_W, SETT_H))
+                        display: YES
+                    ];
+                    let _: () = msg_send![sw, orderFrontRegardless];
+                }
             }
         }
 
         ctrl_decl.add_method(sel!(pulse:),           pulse            as extern "C" fn(&Object, Sel, id));
         ctrl_decl.add_method(sel!(enterPressed:),    enter_pressed    as extern "C" fn(&Object, Sel, id));
         ctrl_decl.add_method(sel!(nextStepPressed:), next_step_pressed as extern "C" fn(&Object, Sel, id));
-        ctrl_decl.add_method(sel!(showColorPanel:),  show_color_panel as extern "C" fn(&Object, Sel, id));
         ctrl_decl.add_method(sel!(colorSelected:),   color_selected   as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(toggleSettings:),  toggle_settings  as extern "C" fn(&Object, Sel, id));
         let ctrl_class = ctrl_decl.register();
         let ctrl: id = msg_send![ctrl_class, alloc];
         let ctrl: id = msg_send![ctrl, init];
@@ -1292,9 +1327,9 @@ fn main() {
         let hint_panel = build_hint_panel();
         HINT_WIN_PTR.set(hint_panel as usize).unwrap();
 
-        // ── Colour picker ─────────────────────────────────────────────────────
-        let color_panel = build_color_panel(ctrl);
-        COLOR_WIN_PTR.set(color_panel as usize).unwrap();
+        // ── Settings / colour picker dropdown ─────────────────────────────────
+        let settings_panel = build_settings_panel(ctrl);
+        SETTINGS_WIN_PTR.set(settings_panel as usize).unwrap();
 
         // ── 50 ms animation timer ─────────────────────────────────────────────
         let _: id = msg_send![class!(NSTimer),
