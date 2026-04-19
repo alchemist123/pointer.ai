@@ -3,6 +3,86 @@
 mod agent;
 use agent::{AgentStep, TourAgent};
 
+use serde::{Serialize, Deserialize};
+
+// ── Persistent config ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PointerConfig {
+    provider:       u8,   // 0 = Groq, 1 = Local
+    groq_api_key:   String,
+    groq_model:     String,
+    groq_url:       String,
+    local_base_url: String,
+    local_api_key:  String,
+    local_model:    String,
+}
+
+impl Default for PointerConfig {
+    fn default() -> Self {
+        Self {
+            provider:       0,
+            groq_api_key:   std::env::var("GROQ_API_KEY").unwrap_or_default(),
+            groq_model:     std::env::var("GROQ_MODEL")
+                                .unwrap_or_else(|_| agent::GROQ_MODEL_DEFAULT.into()),
+            groq_url:       std::env::var("GROQ_URL")
+                                .unwrap_or_else(|_| agent::GROQ_URL_DEFAULT.into()),
+            local_base_url: String::new(),
+            local_api_key:  "EMPTY".into(),
+            local_model:    String::new(),
+        }
+    }
+}
+
+impl PointerConfig {
+    fn effective_api_key(&self) -> &str {
+        if self.provider == 0 { &self.groq_api_key } else { &self.local_api_key }
+    }
+    fn effective_model(&self) -> &str {
+        if self.provider == 0 { &self.groq_model } else { &self.local_model }
+    }
+    fn effective_api_url(&self) -> String {
+        if self.provider == 0 {
+            self.groq_url.clone()
+        } else {
+            format!("{}/chat/completions", self.local_base_url.trim_end_matches('/'))
+        }
+    }
+}
+
+fn config_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(home).join(".pointer_config.json")
+}
+
+fn load_config() -> PointerConfig {
+    if let Ok(data) = std::fs::read_to_string(config_path()) {
+        if let Ok(cfg) = serde_json::from_str(&data) { return cfg; }
+    }
+    PointerConfig::default()
+}
+
+fn save_config(cfg: &PointerConfig) {
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(config_path(), json);
+    }
+}
+
+// ── Model-settings field pointers (all set once during build) ─────────────────
+
+struct MsPtrs {
+    provider_seg:  usize,
+    groq_api_fld:  usize,
+    groq_mdl_fld:  usize,
+    groq_url_fld:  usize,
+    loc_url_fld:   usize,
+    loc_key_fld:   usize,
+    loc_mdl_fld:   usize,
+    groq_box:      usize,
+    loc_box:       usize,
+    status_lbl:    usize,
+}
+
 use cocoa::appkit::{
     NSApp, NSApplication, NSApplicationActivationPolicyAccessory,
     NSBackingStoreType, NSWindow, NSWindowStyleMask,
@@ -23,11 +103,9 @@ const DOT_SZ:  f64 = 40.0;
 const IN_W:    f64 = 360.0;
 const IN_H:    f64 = 52.0;
 const STEP_W:  f64 = 320.0;
-const STEP_H:  f64 = 172.0;
+const STEP_H:  f64 = 210.0;
 const HINT_W:  f64 = 168.0;
 const HINT_H:  f64 = 26.0;
-const SETT_W:  f64 = 200.0;
-const SETT_H:  f64 = 116.0;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 // 0 = hidden
@@ -45,12 +123,14 @@ static CURSOR_TICK:   AtomicU32 = AtomicU32::new(0);
 static CURSOR_ON:     AtomicBool = AtomicBool::new(true);
 static DONE_TICK:     AtomicU32 = AtomicU32::new(0);
 static EVENT_TAP:     AtomicUsize = AtomicUsize::new(0);
+static OVERLAY_ACTIVE: AtomicBool  = AtomicBool::new(false);
 
-static DOT_WIN_PTR:       OnceLock<usize> = OnceLock::new();
-static DOT_VIEW_PTR:      OnceLock<usize> = OnceLock::new();
-static IN_PANEL_PTR:      OnceLock<usize> = OnceLock::new();
-static INPUT_VIEW_PTR:    OnceLock<usize> = OnceLock::new();
-static DISPLAY_FIELD_PTR: OnceLock<usize> = OnceLock::new();
+static DOT_WIN_PTR:        OnceLock<usize> = OnceLock::new();
+static DOT_VIEW_PTR:       OnceLock<usize> = OnceLock::new();
+static IN_PANEL_PTR:       OnceLock<usize> = OnceLock::new();
+static INPUT_VIEW_PTR:     OnceLock<usize> = OnceLock::new();
+static DISPLAY_FIELD_PTR:  OnceLock<usize> = OnceLock::new();
+static DISPLAY_SCROLL_PTR: OnceLock<usize> = OnceLock::new();
 static PLACEHOLDER_PTR:   OnceLock<usize> = OnceLock::new();
 static INPUT_TEXT:        OnceLock<Mutex<String>> = OnceLock::new();
 static LAST_CONTEXT:      OnceLock<Mutex<(String, String)>> = OnceLock::new();
@@ -59,6 +139,7 @@ static LAST_CONTEXT:      OnceLock<Mutex<(String, String)>> = OnceLock::new();
 static STEP_WIN_PTR:      OnceLock<usize> = OnceLock::new();
 static STEP_HEAD_PTR:     OnceLock<usize> = OnceLock::new();
 static STEP_BODY_PTR:     OnceLock<usize> = OnceLock::new();
+static STEP_REASON_PTR:   OnceLock<usize> = OnceLock::new();
 static STEP_NEXT_BTN_PTR: OnceLock<usize> = OnceLock::new();
 static STEP_IS_FINAL:       AtomicBool = AtomicBool::new(false);
 static STEP_ACTION_CLICK:   AtomicBool = AtomicBool::new(false);
@@ -76,14 +157,18 @@ static ANIM_TICK:        AtomicU32 = AtomicU32::new(0);
 
 // Completion flash: counts down ticks before showing the completion panel (-1 = idle)
 static COMPLETE_COUNTDOWN: AtomicI32 = AtomicI32::new(-1);
-static GOAL_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
+static GOAL_TEXT:     OnceLock<Mutex<String>> = OnceLock::new();
+static FINAL_ANSWER:  OnceLock<Mutex<String>> = OnceLock::new();
 
 // Action hint pill + colour picker
 static DOT_COLOR:      AtomicU8  = AtomicU8::new(0); // 0-7 see dot_color_rgb
-static HINT_WIN_PTR:     OnceLock<usize>    = OnceLock::new();
-static HINT_LBL_PTR:     OnceLock<usize>    = OnceLock::new();
-static SETTINGS_WIN_PTR: OnceLock<usize>    = OnceLock::new();
-static SETT_BTN_PTRS:    OnceLock<[usize;8]> = OnceLock::new();
+static HINT_WIN_PTR:     OnceLock<usize>     = OnceLock::new();
+static HINT_LBL_PTR:     OnceLock<usize>     = OnceLock::new();
+static COLOR_WIN_PTR:    OnceLock<usize>     = OnceLock::new();
+static COLOR_BTN_PTRS:   OnceLock<[usize;8]> = OnceLock::new();
+static MODEL_WIN_PTR:    OnceLock<usize>     = OnceLock::new();
+static MS_PTRS:          OnceLock<MsPtrs>    = OnceLock::new();
+static POINTER_CONFIG:   OnceLock<Mutex<PointerConfig>> = OnceLock::new();
 
 // ── Accessors ─────────────────────────────────────────────────────────────────
 
@@ -94,8 +179,9 @@ static SETT_BTN_PTRS:    OnceLock<[usize;8]> = OnceLock::new();
 #[inline] unsafe fn display_field() -> id { *DISPLAY_FIELD_PTR.get().unwrap() as id }
 #[inline] unsafe fn placeholder()   -> id { *PLACEHOLDER_PTR.get().unwrap()   as id }
 #[inline] unsafe fn step_win()      -> id { *STEP_WIN_PTR.get().unwrap()      as id }
-#[inline] unsafe fn hint_win()      -> id { *HINT_WIN_PTR.get().unwrap()       as id }
-#[inline] unsafe fn settings_win()  -> id { *SETTINGS_WIN_PTR.get().unwrap()   as id }
+#[inline] unsafe fn hint_win()      -> id { *HINT_WIN_PTR.get().unwrap()   as id }
+#[inline] unsafe fn color_win()     -> id { *COLOR_WIN_PTR.get().unwrap()   as id }
+#[inline] unsafe fn model_win()     -> id { *MODEL_WIN_PTR.get().unwrap()   as id }
 
 fn dot_color_rgb() -> (f64, f64, f64) {
     match DOT_COLOR.load(Ordering::SeqCst) {
@@ -129,6 +215,16 @@ fn update_display(text: &str) {
         };
         let ns: id = NSString::alloc(nil).init_str(&s);
         let _: () = msg_send![display_field(), setStringValue: ns];
+        let _: () = msg_send![display_field(), sizeToFit];
+        if let Some(&sp) = DISPLAY_SCROLL_PTR.get() {
+            let scroll: id = sp as id;
+            let df_frame: NSRect = msg_send![display_field(), frame];
+            let vis: NSRect = msg_send![scroll, documentVisibleRect];
+            let x = (df_frame.size.width - vis.size.width).max(0.0);
+            let clip: id = msg_send![scroll, contentView];
+            let _: () = msg_send![clip, scrollToPoint: NSPoint::new(x, 0.0)];
+            let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+        }
         let _: () = msg_send![placeholder(), setHidden: if text.is_empty() { NO } else { YES }];
     }
 }
@@ -210,11 +306,13 @@ unsafe fn to_hidden_impl() {
     let _: () = msg_send![dot_win(),  orderOut: nil as id];
     let _: () = msg_send![in_panel(), orderOut: nil as id];
     let _: () = msg_send![step_win(), orderOut: nil as id];
-    if HINT_WIN_PTR.get().is_some()     { let _: () = msg_send![hint_win(),     orderOut: nil as id]; }
-    if SETTINGS_WIN_PTR.get().is_some() { let _: () = msg_send![settings_win(), orderOut: nil as id]; }
+    if HINT_WIN_PTR.get().is_some()  { let _: () = msg_send![hint_win(),  orderOut: nil as id]; }
+    if COLOR_WIN_PTR.get().is_some() { let _: () = msg_send![color_win(), orderOut: nil as id]; }
+    if MODEL_WIN_PTR.get().is_some() { let _: () = msg_send![model_win(), orderOut: nil as id]; }
     let _: () = msg_send![dot_win(),  setIgnoresMouseEvents: NO];
-    if let Some(m) = INPUT_TEXT.get()  { if let Ok(mut g) = m.lock() { g.clear(); } }
+    if let Some(m) = INPUT_TEXT.get()   { if let Ok(mut g) = m.lock() { g.clear(); } }
     if let Some(m) = TOUR_AGENT.get()  { if let Ok(mut g) = m.lock() { *g = None; } }
+    if let Some(m) = FINAL_ANSWER.get() { if let Ok(mut g) = m.lock() { g.clear(); } }
     APP_STATE.store(0, Ordering::SeqCst);
 }
 
@@ -263,13 +361,30 @@ unsafe fn to_loading_impl() {
     let _: () = msg_send![dot_win(), orderFrontRegardless];
     redraw_dot();
 
+    let cfg = POINTER_CONFIG.get().unwrap().lock().unwrap().clone();
+    if cfg.effective_api_key().is_empty() {
+        // No API key configured — open model settings so user can enter one.
+        APP_STATE.store(0, Ordering::SeqCst);
+        let _: () = msg_send![in_panel(), orderOut: nil as id];
+        if MODEL_WIN_PTR.get().is_some() {
+            let _: () = msg_send![model_win(), center];
+            let _: () = msg_send![model_win(), makeKeyAndOrderFront: nil as id];
+        }
+        return;
+    }
+
     // Use primary display dimensions — matches screencapture -m.
     let screens: id = msg_send![class!(NSScreen), screens];
     let primary: id = msg_send![screens, objectAtIndex: 0usize];
     let sf: NSRect  = msg_send![primary, frame];
 
     SCREEN_H_LOGICAL.store(sf.size.height.to_bits(), Ordering::SeqCst);
-    let new_agent = TourAgent::new(query, app, win, url, sf.size.width, sf.size.height);
+    let new_agent = TourAgent::new(
+        query, app, win, url, sf.size.width, sf.size.height,
+        cfg.effective_api_key().to_owned(),
+        cfg.effective_api_url(),
+        cfg.effective_model().to_owned(),
+    );
     if let Some(m) = TOUR_AGENT.get() { if let Ok(mut g) = m.lock() { *g = Some(new_agent); } }
     fire_next_step();
 }
@@ -327,6 +442,8 @@ fn show_step(step: AgentStep) {
         let head_txt = format!("Step {}  ·  {}", step.step_num, step.action.to_uppercase());
         let _: () = msg_send![head, setStringValue: NSString::alloc(nil).init_str(&head_txt)];
         let _: () = msg_send![body, setStringValue: NSString::alloc(nil).init_str(&step.description)];
+        let reason_lbl: id = *STEP_REASON_PTR.get().unwrap() as id;
+        let _: () = msg_send![reason_lbl, setStringValue: NSString::alloc(nil).init_str(&step.reason)];
 
         // Button text + colour based on whether this is the final step.
         let (btn_title, r, g, b) = if step.is_final {
@@ -372,6 +489,11 @@ fn show_step(step: AgentStep) {
         ];
 
         STEP_IS_FINAL.store(step.is_final, Ordering::SeqCst);
+        if step.is_final {
+            if let Some(m) = FINAL_ANSWER.get() {
+                if let Ok(mut g) = m.lock() { *g = step.description.clone(); }
+            }
+        }
         BLINK_TICK.store(0, Ordering::SeqCst);
         APP_STATE.store(4, Ordering::SeqCst);
         let _: () = msg_send![step_win(), orderFrontRegardless];
@@ -399,6 +521,8 @@ fn on_next_step_pressed() {
                 NSString::alloc(nil).init_str("✓  Step done!")];
             let _: () = msg_send![body, setStringValue:
                 NSString::alloc(nil).init_str("Nice work! Wrapping up…")];
+            let reason_lbl: id = *STEP_REASON_PTR.get().unwrap() as id;
+            let _: () = msg_send![reason_lbl, setStringValue: NSString::alloc(nil).init_str("")];
             let _: () = msg_send![btn, setTitle: NSString::alloc(nil).init_str("✓")];
             let btn_layer: id = msg_send![btn, layer];
             let green: id = msg_send![class!(NSColor),
@@ -435,13 +559,26 @@ unsafe fn show_completion() {
     let btn:  id = *STEP_NEXT_BTN_PTR.get().unwrap() as id;
 
     let _: () = msg_send![head, setStringValue: NSString::alloc(nil).init_str("🎉  All done!")];
-    let body_text = if goal.is_empty() {
+    let final_ans = FINAL_ANSWER.get()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let body_text = if !final_ans.is_empty() {
+        final_ans.clone()
+    } else if goal.is_empty() {
         "You completed all the steps — great job!".to_owned()
     } else {
         format!("You completed: {}", goal)
     };
     let _: () = msg_send![body, setStringValue:
         NSString::alloc(nil).init_str(&body_text)];
+    let reason_lbl: id = *STEP_REASON_PTR.get().unwrap() as id;
+    let reason_text = if !final_ans.is_empty() {
+        format!("Goal: {goal}")
+    } else {
+        String::new()
+    };
+    let _: () = msg_send![reason_lbl, setStringValue: NSString::alloc(nil).init_str(&reason_text)];
     let _: () = msg_send![btn, setTitle: NSString::alloc(nil).init_str("Close guide")];
     let btn_layer: id = msg_send![btn, layer];
     let green: id = msg_send![class!(NSColor),
@@ -661,18 +798,33 @@ unsafe fn build_input_panel(ctrl: id) -> id {
     let txt_x  = 14.0_f64;
     let txt_w  = gear_x - 8.0 - txt_x;         // 262
 
-    // Display label
+    // Display label — wrapped in a no-scrollbar NSScrollView for horizontal overflow
     let th = 22.0_f64;
     let ty = cy - th / 2.0;
     let df: id = msg_send![class!(NSTextField), alloc];
-    let df: id = msg_send![df, initWithFrame: NSRect::new(NSPoint::new(txt_x, ty), NSSize::new(txt_w, th))];
+    let df: id = msg_send![df, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(txt_w, th))];
     let _: () = msg_send![df, setEditable: NO]; let _: () = msg_send![df, setSelectable: NO];
     let _: () = msg_send![df, setBezeled: NO];  let _: () = msg_send![df, setDrawsBackground: NO];
     let df_font: id = msg_send![class!(NSFont), systemFontOfSize: 16.0_f64];
     let _: () = msg_send![df, setFont: df_font];
     let _: () = msg_send![df, setTextColor: white];
     let _: () = msg_send![df, setStringValue: NSString::alloc(nil).init_str("")];
-    let _: () = msg_send![ve, addSubview: df];
+    // Configure cell: single line, no wrap, scrollable
+    let df_cell: id = msg_send![df, cell];
+    let _: () = msg_send![df_cell, setScrollable: YES];
+    let _: () = msg_send![df_cell, setWraps: NO];
+    let _: () = msg_send![df_cell, setLineBreakMode: 0_i64]; // NSLineBreakByWordWrapping → clip
+    // NSScrollView wrapper (no scrollbars, transparent)
+    let scroll: id = msg_send![class!(NSScrollView), alloc];
+    let scroll: id = msg_send![scroll, initWithFrame: NSRect::new(NSPoint::new(txt_x, ty), NSSize::new(txt_w, th))];
+    let _: () = msg_send![scroll, setHasHorizontalScroller: NO];
+    let _: () = msg_send![scroll, setHasVerticalScroller: NO];
+    let _: () = msg_send![scroll, setDrawsBackground: NO];
+    let _: () = msg_send![scroll, setBorderType: 0_i64];
+    let _: () = msg_send![scroll, setDocumentView: df];
+    let clip: id = msg_send![scroll, contentView];
+    let _: () = msg_send![clip, setDrawsBackground: NO];
+    let _: () = msg_send![ve, addSubview: scroll];
 
     // Placeholder
     let ph: id = msg_send![class!(NSTextField), alloc];
@@ -728,22 +880,23 @@ unsafe fn build_input_panel(ctrl: id) -> id {
     let _: () = msg_send![btn, setTarget: ctrl];
     let _: () = msg_send![ve, addSubview: btn];
 
-    DISPLAY_FIELD_PTR.set(df as usize).unwrap();
-    PLACEHOLDER_PTR  .set(ph as usize).unwrap();
-    INPUT_VIEW_PTR   .set(iv as usize).unwrap();
+    DISPLAY_FIELD_PTR .set(df     as usize).unwrap();
+    DISPLAY_SCROLL_PTR.set(scroll as usize).unwrap();
+    PLACEHOLDER_PTR   .set(ph     as usize).unwrap();
+    INPUT_VIEW_PTR    .set(iv     as usize).unwrap();
     panel
 }
 
 // ── Step panel ────────────────────────────────────────────────────────────────
 //
-//  172 ┌──────────────────────────────────────┐
-//      │  Step N · ACTION          (11pt dim) │  y=150, h=18
-//  150 │ ─────────────────────────────────── │  sep y=148
-//      │                                      │
-//      │  Full instruction (14pt white, wrap) │  y=56, h=88
-//      │                                      │
-//   56 │ ─────────────────────────────────── │  sep y=54
-//      │  [ I did it →  ]                    │  y=10, h=40
+//  210 ┌──────────────────────────────────────┐
+//      │  Step N · ACTION          (11pt dim) │  y=188, h=18
+//  186 │ ─────────────────────────────────── │  sep y=186
+//      │  description (14pt white, 3 lines)   │  y=130, h=52
+//      │  reason (11pt dim, 3 lines)          │  y=76,  h=50
+//   74 │ ─────────────────────────────────── │  sep y=74
+//      │  [ I did it →  ]                    │  y=12, h=56... no, keep 40
+//      │                                      │  y=14, h=40
 //  ────┘
 
 unsafe fn build_step_panel(ctrl: id) -> id {
@@ -804,30 +957,44 @@ unsafe fn build_step_panel(ctrl: id) -> id {
     // Header: "Step N · ACTION"
     let head_font: id = msg_send![class!(NSFont), systemFontOfSize: 11.0_f64];
     let head = make_lbl(
-        NSRect::new(NSPoint::new(pad, 150.0), NSSize::new(cw, 18.0)),
+        NSRect::new(NSPoint::new(pad, 188.0), NSSize::new(cw, 18.0)),
         head_font, dim, "",
     );
     let _: () = msg_send![ve, addSubview: head];
-    let _: () = msg_send![ve, addSubview: make_sep(148.0)];
+    let _: () = msg_send![ve, addSubview: make_sep(186.0)];
 
-    // Body
+    // Description (what to do)
     let body_font: id = msg_send![class!(NSFont), systemFontOfSize: 14.0_f64];
     let body = make_lbl(
-        NSRect::new(NSPoint::new(pad, 56.0), NSSize::new(cw, 88.0)),
+        NSRect::new(NSPoint::new(pad, 130.0), NSSize::new(cw, 52.0)),
         body_font, white, "",
     );
     let _: () = msg_send![body, setLineBreakMode: 6_i64];
-    let _: () = msg_send![body, setMaximumNumberOfLines: 5_i64];
+    let _: () = msg_send![body, setMaximumNumberOfLines: 3_i64];
     let body_cell: id = msg_send![body, cell];
     let _: () = msg_send![body_cell, setWraps: YES];
     let _: () = msg_send![body_cell, setScrollable: NO];
     let _: () = msg_send![ve, addSubview: body];
-    let _: () = msg_send![ve, addSubview: make_sep(54.0)];
+
+    // Reason (why this step)
+    let reason_font: id = msg_send![class!(NSFont), systemFontOfSize: 11.5_f64];
+    let reason_color: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.55_f64];
+    let reason = make_lbl(
+        NSRect::new(NSPoint::new(pad, 78.0), NSSize::new(cw, 48.0)),
+        reason_font, reason_color, "",
+    );
+    let _: () = msg_send![reason, setLineBreakMode: 6_i64];
+    let _: () = msg_send![reason, setMaximumNumberOfLines: 3_i64];
+    let reason_cell: id = msg_send![reason, cell];
+    let _: () = msg_send![reason_cell, setWraps: YES];
+    let _: () = msg_send![reason_cell, setScrollable: NO];
+    let _: () = msg_send![ve, addSubview: reason];
+    let _: () = msg_send![ve, addSubview: make_sep(74.0)];
 
     // "I did it →" button
     let next_btn: id = msg_send![class!(NSButton), alloc];
     let next_btn: id = msg_send![next_btn,
-        initWithFrame: NSRect::new(NSPoint::new(pad, 10.0), NSSize::new(cw, 40.0))
+        initWithFrame: NSRect::new(NSPoint::new(pad, 14.0), NSSize::new(cw, 40.0))
     ];
     let _: () = msg_send![next_btn, setBezelStyle: 0_i64];
     let _: () = msg_send![next_btn, setBordered: NO];
@@ -847,6 +1014,7 @@ unsafe fn build_step_panel(ctrl: id) -> id {
 
     STEP_HEAD_PTR    .set(head     as usize).unwrap();
     STEP_BODY_PTR    .set(body     as usize).unwrap();
+    STEP_REASON_PTR  .set(reason   as usize).unwrap();
     STEP_NEXT_BTN_PTR.set(next_btn as usize).unwrap();
     panel
 }
@@ -917,71 +1085,36 @@ unsafe fn build_hint_panel() -> id {
 }
 
 
-// ── Settings / colour picker dropdown ────────────────────────────────────────
+// ── Colour picker panel ───────────────────────────────────────────────────────
 
-unsafe fn build_settings_panel(ctrl: id) -> id {
+unsafe fn build_color_panel(ctrl: id) -> id {
+    // NSTitledWindowMask(1) | NSClosableWindowMask(2) — standard macOS chrome
     let panel: id = msg_send![class!(NSPanel), alloc];
     let panel: id = msg_send![panel,
-        initWithContentRect: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(SETT_W, SETT_H))
-        styleMask: 0u64 backing: 2u64 defer: NO
+        initWithContentRect: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(256.0, 150.0))
+        styleMask: 3u64 backing: 2u64 defer: NO
     ];
-    let _: () = msg_send![panel, setOpaque: NO];
-    let clear: id = msg_send![class!(NSColor), clearColor];
-    let _: () = msg_send![panel, setBackgroundColor: clear];
-    let _: () = msg_send![panel, setLevel: 26_i64];
-    let _: () = msg_send![panel, setHasShadow: YES];
-    let _: () = msg_send![panel, setCollectionBehavior: 1u64];
+    let _: () = msg_send![panel, setTitle: NSString::alloc(nil).init_str("Pointer Colour")];
+    let _: () = msg_send![panel, setReleasedWhenClosed: NO];
+    let _: () = msg_send![panel, setFloatingPanel: YES];
     let _: () = msg_send![panel, setHidesOnDeactivate: NO];
+    let _: () = msg_send![panel, setCollectionBehavior: 1u64];
 
-    // NSVisualEffectMaterial.popover (6) — same material as input/step panels
-    let ve: id = msg_send![class!(NSVisualEffectView), alloc];
-    let ve: id = msg_send![ve,
-        initWithFrame: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(SETT_W, SETT_H))
-    ];
-    let _: () = msg_send![ve, setMaterial: 6_i64];
-    let _: () = msg_send![ve, setBlendingMode: 0_i64];
-    let _: () = msg_send![ve, setState: 1_i64];
-    let _: () = msg_send![ve, setWantsLayer: YES];
-    let vel: id = msg_send![ve, layer];
-    let _: () = msg_send![vel, setCornerRadius: 12.0_f64];
-    let _: () = msg_send![vel, setMasksToBounds: YES];
-    let _: () = msg_send![panel, setContentView: ve];
-    force_dark(ve);
+    let content: id = msg_send![panel, contentView];
 
-    // "Pointer Colour" header label
-    let hdr: id = msg_send![class!(NSTextField), alloc];
-    let hdr: id = msg_send![hdr,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, SETT_H - 26.0), NSSize::new(SETT_W, 18.0))
+    let colors: [(f64,f64,f64); 8] = [
+        (0.10,0.50,1.00),(1.00,0.22,0.15),(0.12,0.75,0.30),(1.00,0.55,0.05),
+        (0.65,0.20,0.90),(1.00,0.25,0.60),(0.00,0.75,0.75),(0.95,0.80,0.00),
     ];
-    let _: () = msg_send![hdr, setEditable: NO]; let _: () = msg_send![hdr, setBezeled: NO];
-    let _: () = msg_send![hdr, setDrawsBackground: NO]; let _: () = msg_send![hdr, setSelectable: NO];
-    let _: () = msg_send![hdr, setAlignment: 2_i64];
-    let hf: id = msg_send![class!(NSFont), boldSystemFontOfSize: 11.0_f64];
-    let _: () = msg_send![hdr, setFont: hf];
-    let dc: id = msg_send![class!(NSColor), colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.55_f64];
-    let _: () = msg_send![hdr, setTextColor: dc];
-    let _: () = msg_send![hdr, setStringValue: NSString::alloc(nil).init_str("Pointer Colour")];
-    let _: () = msg_send![ve, addSubview: hdr];
-
-    // 8 colour swatches in two rows of 4
-    let colors: [(f64, f64, f64); 8] = [
-        (0.10, 0.50, 1.00), // blue
-        (1.00, 0.22, 0.15), // red
-        (0.12, 0.75, 0.30), // green
-        (1.00, 0.55, 0.05), // orange
-        (0.65, 0.20, 0.90), // purple
-        (1.00, 0.25, 0.60), // pink
-        (0.00, 0.75, 0.75), // teal
-        (0.95, 0.80, 0.00), // yellow
-    ];
-    let sz  = 28.0_f64;
-    let gap = 12.0_f64;
-    let cols = 4_usize;
-    let row_w = cols as f64 * sz + (cols - 1) as f64 * gap;
-    let x0    = (SETT_W - row_w) / 2.0;
-    let row1_y = SETT_H - 30.0 - sz;
-    let row2_y = row1_y - gap - sz;
-    let cur   = DOT_COLOR.load(std::sync::atomic::Ordering::SeqCst) as usize;
+    let sz    = 26.0_f64;
+    let gap   = 12.0_f64;
+    let cols  = 4_usize;
+    let row_w = cols as f64 * sz + (cols-1) as f64 * gap; // 134
+    let x0    = (256.0 - row_w) / 2.0;
+    // center rows vertically in 150px content
+    let row1_y = 80.0_f64; // top row
+    let row2_y = 44.0_f64; // bottom row
+    let cur = DOT_COLOR.load(Ordering::SeqCst) as usize;
 
     let mut btn_ptrs = [0usize; 8];
     for (i, &(r, g, b)) in colors.iter().enumerate() {
@@ -1000,22 +1133,189 @@ unsafe fn build_settings_panel(ctrl: id) -> id {
         let col: id = msg_send![class!(NSColor), colorWithRed:r green:g blue:b alpha:1.0_f64];
         let cg: id  = msg_send![col, CGColor];
         let _: () = msg_send![bl, setBackgroundColor: cg];
-        let _: () = msg_send![bl, setCornerRadius: sz / 2.0];
-        // White ring on currently selected colour
+        let _: () = msg_send![bl, setCornerRadius: sz/2.0];
         if i == cur {
-            let wh: id = msg_send![class!(NSColor), whiteColor];
-            let wc: id = msg_send![wh, CGColor];
-            let _: () = msg_send![bl, setBorderColor: wc];
-            let _: () = msg_send![bl, setBorderWidth: 2.5_f64];
+            let ac: id = msg_send![class!(NSColor), controlAccentColor];
+            let ac_cg: id = msg_send![ac, CGColor];
+            let _: () = msg_send![bl, setBorderColor: ac_cg];
+            let _: () = msg_send![bl, setBorderWidth: 3.0_f64];
         }
         let _: () = msg_send![btn, setTitle: NSString::alloc(nil).init_str("")];
         let _: () = msg_send![btn, setTag: i as i64];
         let _: () = msg_send![btn, setAction: sel!(colorSelected:)];
         let _: () = msg_send![btn, setTarget: ctrl];
-        let _: () = msg_send![ve, addSubview: btn];
+        let _: () = msg_send![content, addSubview: btn];
         btn_ptrs[i] = btn as usize;
     }
-    SETT_BTN_PTRS.set(btn_ptrs).ok(); // ok() — ignore if already set (shouldn't happen)
+    COLOR_BTN_PTRS.set(btn_ptrs).ok();
+    panel
+}
+
+// ── Model settings panel ──────────────────────────────────────────────────────
+
+unsafe fn build_model_settings_panel(ctrl: id) -> id {
+    // Content rect 360×284; AppKit adds ~28px title bar automatically
+    let panel: id = msg_send![class!(NSPanel), alloc];
+    let panel: id = msg_send![panel,
+        initWithContentRect: NSRect::new(NSPoint::new(0.0,0.0), NSSize::new(360.0, 284.0))
+        styleMask: 3u64 backing: 2u64 defer: NO
+    ];
+    let _: () = msg_send![panel, setTitle: NSString::alloc(nil).init_str("Model Settings")];
+    let _: () = msg_send![panel, setReleasedWhenClosed: NO];
+    let _: () = msg_send![panel, setFloatingPanel: YES];
+    let _: () = msg_send![panel, setHidesOnDeactivate: NO];
+    let _: () = msg_send![panel, setCollectionBehavior: 1u64];
+
+    let content: id = msg_send![panel, contentView];
+    let pad = 20.0_f64;
+    let fw  = 360.0 - pad * 2.0; // field width = 320
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    let make_label = |y: f64, h: f64, text: &str, bold: bool| -> id {
+        let f: id = msg_send![class!(NSTextField), alloc];
+        let f: id = msg_send![f, initWithFrame: NSRect::new(NSPoint::new(pad, y), NSSize::new(fw, h))];
+        let _: () = msg_send![f, setEditable: NO]; let _: () = msg_send![f, setBezeled: NO];
+        let _: () = msg_send![f, setDrawsBackground: NO]; let _: () = msg_send![f, setSelectable: NO];
+        let font: id = if bold {
+            msg_send![class!(NSFont), boldSystemFontOfSize: 12.0_f64]
+        } else {
+            msg_send![class!(NSFont), systemFontOfSize: 11.0_f64]
+        };
+        let _: () = msg_send![f, setFont: font];
+        let c: id = msg_send![class!(NSColor), secondaryLabelColor];
+        let _: () = msg_send![f, setTextColor: c];
+        let _: () = msg_send![f, setStringValue: NSString::alloc(nil).init_str(text)];
+        f
+    };
+    let make_field = |y: f64, ph: &str| -> id {
+        let f: id = msg_send![class!(NSTextField), alloc];
+        let f: id = msg_send![f, initWithFrame: NSRect::new(NSPoint::new(pad, y), NSSize::new(fw, 22.0))];
+        let _: () = msg_send![f, setEditable: YES]; let _: () = msg_send![f, setBezeled: YES];
+        let font: id = msg_send![class!(NSFont), systemFontOfSize: 13.0_f64];
+        let _: () = msg_send![f, setFont: font];
+        let cell: id = msg_send![f, cell];
+        let _: () = msg_send![cell, setPlaceholderString: NSString::alloc(nil).init_str(ph)];
+        f
+    };
+
+    // ── Provider label + segmented control ────────────────────────────────────
+    let _: () = msg_send![content, addSubview: make_label(259.0, 13.0, "PROVIDER", false)];
+
+    let seg: id = msg_send![class!(NSSegmentedControl), alloc];
+    let seg: id = msg_send![seg, initWithFrame: NSRect::new(NSPoint::new(pad, 231.0), NSSize::new(fw, 24.0))];
+    let _: () = msg_send![seg, setSegmentCount: 2_i64];
+    let _: () = msg_send![seg, setLabel: NSString::alloc(nil).init_str("Groq") forSegment: 0_i64];
+    let _: () = msg_send![seg, setLabel: NSString::alloc(nil).init_str("Local / Self-hosted") forSegment: 1_i64];
+    let _: () = msg_send![seg, setSelectedSegment: 0_i64];
+    let _: () = msg_send![seg, setTrackingMode: 1_i64]; // NSSegmentSwitchTrackingSelectOne
+    let _: () = msg_send![seg, setAction: sel!(providerChanged:)];
+    let _: () = msg_send![seg, setTarget: ctrl];
+    let _: () = msg_send![content, addSubview: seg];
+
+    // ── Separator ─────────────────────────────────────────────────────────────
+    let sep_top: id = msg_send![class!(NSBox), alloc];
+    let sep_top: id = msg_send![sep_top,
+        initWithFrame: NSRect::new(NSPoint::new(pad, 223.0), NSSize::new(fw, 1.0))
+    ];
+    let _: () = msg_send![sep_top, setBoxType: 2_i64];
+    let _: () = msg_send![content, addSubview: sep_top];
+
+    // ── Groq container ────────────────────────────────────────────────────────
+    let groq_box: id = msg_send![class!(NSView), alloc];
+    let groq_box: id = msg_send![groq_box,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 73.0), NSSize::new(360.0, 148.0))
+    ];
+
+    let _: () = msg_send![groq_box, addSubview: make_label(135.0, 11.0, "API KEY", false)];
+    let groq_api = make_field(113.0, "gsk_…");
+    let _: () = msg_send![groq_box, addSubview: groq_api];
+
+    let _: () = msg_send![groq_box, addSubview: make_label(90.0, 11.0, "MODEL", false)];
+    let groq_mdl = make_field(68.0, agent::GROQ_MODEL_DEFAULT);
+    let _: () = msg_send![groq_box, addSubview: groq_mdl];
+
+    let _: () = msg_send![groq_box, addSubview: make_label(45.0, 11.0, "API URL", false)];
+    let groq_url = make_field(23.0, agent::GROQ_URL_DEFAULT);
+    let _: () = msg_send![groq_box, addSubview: groq_url];
+    let _: () = msg_send![content, addSubview: groq_box];
+
+    // ── Local container (hidden by default) ───────────────────────────────────
+    let loc_box: id = msg_send![class!(NSView), alloc];
+    let loc_box: id = msg_send![loc_box,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 73.0), NSSize::new(360.0, 148.0))
+    ];
+    let _: () = msg_send![loc_box, setHidden: YES];
+
+    let _: () = msg_send![loc_box, addSubview: make_label(135.0, 11.0, "BASE URL", false)];
+    let loc_url = make_field(113.0, "http://host:8000/v1");
+    let _: () = msg_send![loc_box, addSubview: loc_url];
+
+    let _: () = msg_send![loc_box, addSubview: make_label(90.0, 11.0, "API KEY (use EMPTY if none)", false)];
+    let loc_key = make_field(68.0, "EMPTY");
+    let _: () = msg_send![loc_box, addSubview: loc_key];
+
+    let _: () = msg_send![loc_box, addSubview: make_label(45.0, 11.0, "MODEL NAME", false)];
+    let loc_mdl = make_field(23.0, "llama-3…");
+    let _: () = msg_send![loc_box, addSubview: loc_mdl];
+    let _: () = msg_send![content, addSubview: loc_box];
+
+    // ── Separator above buttons ────────────────────────────────────────────────
+    let sep_bot: id = msg_send![class!(NSBox), alloc];
+    let sep_bot: id = msg_send![sep_bot,
+        initWithFrame: NSRect::new(NSPoint::new(pad, 67.0), NSSize::new(fw, 1.0))
+    ];
+    let _: () = msg_send![sep_bot, setBoxType: 2_i64];
+    let _: () = msg_send![content, addSubview: sep_bot];
+
+    // ── Status label ──────────────────────────────────────────────────────────
+    let status: id = msg_send![class!(NSTextField), alloc];
+    let status: id = msg_send![status,
+        initWithFrame: NSRect::new(NSPoint::new(pad, 48.0), NSSize::new(fw, 14.0))
+    ];
+    let _: () = msg_send![status, setEditable: NO]; let _: () = msg_send![status, setBezeled: NO];
+    let _: () = msg_send![status, setDrawsBackground: NO]; let _: () = msg_send![status, setSelectable: NO];
+    let sf: id = msg_send![class!(NSFont), systemFontOfSize: 11.0_f64];
+    let _: () = msg_send![status, setFont: sf];
+    let sc: id = msg_send![class!(NSColor), secondaryLabelColor];
+    let _: () = msg_send![status, setTextColor: sc];
+    let _: () = msg_send![status, setStringValue: NSString::alloc(nil).init_str("")];
+    let _: () = msg_send![content, addSubview: status];
+
+    // ── Test connection button ────────────────────────────────────────────────
+    let test_btn: id = msg_send![class!(NSButton), alloc];
+    let test_btn: id = msg_send![test_btn,
+        initWithFrame: NSRect::new(NSPoint::new(pad, 12.0), NSSize::new(148.0, 28.0))
+    ];
+    let _: () = msg_send![test_btn, setBezelStyle: 1_i64]; // NSBezelStyleRounded
+    let _: () = msg_send![test_btn, setTitle: NSString::alloc(nil).init_str("Test Connection")];
+    let _: () = msg_send![test_btn, setAction: sel!(testConnection:)];
+    let _: () = msg_send![test_btn, setTarget: ctrl];
+    let _: () = msg_send![content, addSubview: test_btn];
+
+    // ── Apply button (default/blue) ───────────────────────────────────────────
+    let apply_btn: id = msg_send![class!(NSButton), alloc];
+    let apply_btn: id = msg_send![apply_btn,
+        initWithFrame: NSRect::new(NSPoint::new(192.0, 12.0), NSSize::new(148.0, 28.0))
+    ];
+    let _: () = msg_send![apply_btn, setBezelStyle: 1_i64];
+    let _: () = msg_send![apply_btn, setTitle: NSString::alloc(nil).init_str("Apply")];
+    let _: () = msg_send![apply_btn, setKeyEquivalent: NSString::alloc(nil).init_str("\r")];
+    let _: () = msg_send![apply_btn, setAction: sel!(applySettings:)];
+    let _: () = msg_send![apply_btn, setTarget: ctrl];
+    let _: () = msg_send![content, addSubview: apply_btn];
+
+    MS_PTRS.set(MsPtrs {
+        provider_seg:  seg      as usize,
+        groq_api_fld:  groq_api as usize,
+        groq_mdl_fld:  groq_mdl as usize,
+        groq_url_fld:  groq_url as usize,
+        loc_url_fld:   loc_url  as usize,
+        loc_key_fld:   loc_key  as usize,
+        loc_mdl_fld:   loc_mdl  as usize,
+        groq_box:      groq_box as usize,
+        loc_box:       loc_box  as usize,
+        status_lbl:    status   as usize,
+    }).ok();
     panel
 }
 
@@ -1110,7 +1410,7 @@ unsafe extern "C" fn event_tap_cb(
             dispatch::Queue::main().exec_async(toggle);
             return std::ptr::null();
         }
-        if state == 2 {
+        if state == 2 && !OVERLAY_ACTIVE.load(Ordering::SeqCst) && !cmd {
             let mut buf = [0u16; 4]; let mut len: usize = 0;
             CGEventKeyboardGetUnicodeString(event, buf.len(), &mut len, buf.as_mut_ptr());
             let ch = String::from_utf16_lossy(&buf[..len]).to_owned();
@@ -1122,7 +1422,7 @@ unsafe extern "C" fn event_tap_cb(
             dispatch::Queue::main().exec_async(to_hidden);
         }
     }
-    if state == 2 && ev_type == CGE_KEY_UP { return std::ptr::null(); }
+    if state == 2 && !OVERLAY_ACTIVE.load(Ordering::SeqCst) && !cmd && ev_type == CGE_KEY_UP { return std::ptr::null(); }
     event
 }
 
@@ -1154,10 +1454,12 @@ fn main() {
 
         ensure_accessibility();
 
+        POINTER_CONFIG.set(Mutex::new(load_config())).unwrap();
         INPUT_TEXT  .set(Mutex::new(String::new())).unwrap();
         LAST_CONTEXT.set(Mutex::new((String::new(), String::new()))).unwrap();
         TOUR_AGENT  .set(Mutex::new(None)).unwrap();
         GOAL_TEXT   .set(Mutex::new(String::new())).unwrap();
+        FINAL_ANSWER.set(Mutex::new(String::new())).unwrap();
 
         let view_class = register_pointer_view();
 
@@ -1166,6 +1468,14 @@ fn main() {
             .expect("AppController already declared");
 
         extern "C" fn pulse(_: &Object, _: Sel, _: id) {
+            // Track whether the model-settings panel is frontmost so the event
+            // tap knows to let system key events (Cmd+C/V etc.) pass through.
+            if MODEL_WIN_PTR.get().is_some() {
+                unsafe {
+                    let vis: BOOL = msg_send![model_win(), isVisible];
+                    OVERLAY_ACTIVE.store(vis == YES, Ordering::SeqCst);
+                }
+            }
             let state = APP_STATE.load(Ordering::SeqCst);
             match state {
                 1 | 4 => {
@@ -1241,56 +1551,172 @@ fn main() {
                 let tag: i64 = msg_send![sender, tag];
                 DOT_COLOR.store(tag as u8, Ordering::SeqCst);
                 // Update selection ring on all swatches
-                if let Some(ptrs) = SETT_BTN_PTRS.get() {
+                if let Some(ptrs) = COLOR_BTN_PTRS.get() {
                     for (i, &ptr) in ptrs.iter().enumerate() {
                         let btn: id = ptr as id;
                         let layer: id = msg_send![btn, layer];
                         if i == tag as usize {
-                            let wh: id = msg_send![class!(NSColor), whiteColor];
-                            let wc: id = msg_send![wh, CGColor];
-                            let _: () = msg_send![layer, setBorderColor: wc];
-                            let _: () = msg_send![layer, setBorderWidth: 2.5_f64];
+                            let ac: id = msg_send![class!(NSColor), controlAccentColor];
+                            let ac_cg: id = msg_send![ac, CGColor];
+                            let _: () = msg_send![layer, setBorderColor: ac_cg];
+                            let _: () = msg_send![layer, setBorderWidth: 3.0_f64];
                         } else {
                             let _: () = msg_send![layer, setBorderWidth: 0.0_f64];
                         }
                     }
                 }
                 redraw_dot();
-                if SETTINGS_WIN_PTR.get().is_some() {
-                    let _: () = msg_send![settings_win(), orderOut: nil as id];
-                }
             }
         }
 
-        extern "C" fn toggle_settings(_: &Object, _: Sel, _: id) {
+        // Show NSMenu with Colour / Model Settings entries
+        extern "C" fn toggle_settings(this: &Object, _: Sel, sender: id) {
             unsafe {
-                if SETTINGS_WIN_PTR.get().is_none() { return; }
-                let sw: id = settings_win();
-                let visible: BOOL = msg_send![sw, isVisible];
-                if visible == YES {
-                    let _: () = msg_send![sw, orderOut: nil as id];
-                } else {
-                    let ip_f: NSRect = msg_send![in_panel(), frame];
-                    let px = ip_f.origin.x + (IN_W - SETT_W) / 2.0;
-                    let py_above = ip_f.origin.y + IN_H + 6.0;
-                    let py_below = ip_f.origin.y - SETT_H - 6.0;
-                    let screen: id = msg_send![class!(NSScreen), mainScreen];
-                    let sf: NSRect = msg_send![screen, frame];
-                    let py = if py_above + SETT_H < sf.size.height { py_above } else { py_below.max(0.0) };
-                    let _: () = msg_send![sw,
-                        setFrame: NSRect::new(NSPoint::new(px, py), NSSize::new(SETT_W, SETT_H))
-                        display: YES
+                let ctrl: id = this as *const Object as id;
+                let menu: id = msg_send![class!(NSMenu), alloc];
+                let menu: id = msg_send![menu, initWithTitle: NSString::alloc(nil).init_str("")];
+                let _: () = msg_send![menu, setAutoenablesItems: NO];
+
+                for (title, sel) in &[
+                    ("Pointer Colour",  sel!(openColorPanel:)),
+                    ("Model Settings",  sel!(openModelSettings:)),
+                ] {
+                    let item: id = msg_send![class!(NSMenuItem), alloc];
+                    let item: id = msg_send![item,
+                        initWithTitle: NSString::alloc(nil).init_str(title)
+                        action: *sel
+                        keyEquivalent: NSString::alloc(nil).init_str("")
                     ];
-                    let _: () = msg_send![sw, orderFrontRegardless];
+                    let _: () = msg_send![item, setTarget: ctrl];
+                    let _: () = msg_send![item, setEnabled: YES];
+                    let _: () = msg_send![menu, addItem: item];
+                }
+                let loc = NSPoint::new(0.0, 0.0);
+                let _: BOOL = msg_send![menu, popUpMenuPositioningItem: nil as id
+                                        atLocation: loc inView: sender];
+            }
+        }
+
+        // Show colour panel
+        extern "C" fn open_color_panel(_: &Object, _: Sel, _: id) {
+            unsafe {
+                if COLOR_WIN_PTR.get().is_none() { return; }
+                let w: id = color_win();
+                let visible: BOOL = msg_send![w, isVisible];
+                if visible == YES {
+                    let _: () = msg_send![w, orderFront: nil as id];
+                } else {
+                    let _: () = msg_send![w, center];
+                    let _: () = msg_send![w, makeKeyAndOrderFront: nil as id];
                 }
             }
         }
 
-        ctrl_decl.add_method(sel!(pulse:),           pulse            as extern "C" fn(&Object, Sel, id));
-        ctrl_decl.add_method(sel!(enterPressed:),    enter_pressed    as extern "C" fn(&Object, Sel, id));
-        ctrl_decl.add_method(sel!(nextStepPressed:), next_step_pressed as extern "C" fn(&Object, Sel, id));
-        ctrl_decl.add_method(sel!(colorSelected:),   color_selected   as extern "C" fn(&Object, Sel, id));
-        ctrl_decl.add_method(sel!(toggleSettings:),  toggle_settings  as extern "C" fn(&Object, Sel, id));
+        // Populate + show model settings panel
+        extern "C" fn open_model_settings(_: &Object, _: Sel, _: id) {
+            unsafe {
+                let Some(ptrs) = MS_PTRS.get() else { return };
+                let cfg = POINTER_CONFIG.get().unwrap().lock().unwrap().clone();
+                // Populate fields
+                let _: () = msg_send![ptrs.provider_seg as id, setSelectedSegment: cfg.provider as i64];
+                let set_val = |ptr: usize, s: &str| {
+                    let _: () = msg_send![ptr as id, setStringValue: NSString::alloc(nil).init_str(s)];
+                };
+                set_val(ptrs.groq_api_fld, &cfg.groq_api_key);
+                set_val(ptrs.groq_mdl_fld, &cfg.groq_model);
+                set_val(ptrs.groq_url_fld, &cfg.groq_url);
+                set_val(ptrs.loc_url_fld,  &cfg.local_base_url);
+                set_val(ptrs.loc_key_fld,  &cfg.local_api_key);
+                set_val(ptrs.loc_mdl_fld,  &cfg.local_model);
+                set_val(ptrs.status_lbl,   "");
+                // Show correct container
+                let _: () = msg_send![ptrs.groq_box as id, setHidden: if cfg.provider==0 { NO } else { YES }];
+                let _: () = msg_send![ptrs.loc_box  as id, setHidden: if cfg.provider==0 { YES } else { NO }];
+                let _: () = msg_send![model_win(), center];
+                let _: () = msg_send![model_win(), makeKeyAndOrderFront: nil as id];
+            }
+        }
+
+        // Toggle Groq / Local containers when segment changes
+        extern "C" fn provider_changed(_: &Object, _: Sel, sender: id) {
+            unsafe {
+                let sel: i64 = msg_send![sender, selectedSegment];
+                if let Some(ptrs) = MS_PTRS.get() {
+                    let _: () = msg_send![ptrs.groq_box as id, setHidden: if sel==0 { NO } else { YES }];
+                    let _: () = msg_send![ptrs.loc_box  as id, setHidden: if sel==0 { YES } else { NO }];
+                }
+            }
+        }
+
+        // Fire API test in background, update status label
+        extern "C" fn test_connection(_: &Object, _: Sel, _: id) {
+            unsafe {
+                let Some(ptrs) = MS_PTRS.get() else { return };
+                let _: () = msg_send![ptrs.status_lbl as id,
+                    setStringValue: NSString::alloc(nil).init_str("Testing…")];
+
+                let seg: id = ptrs.provider_seg as id;
+                let prov: i64 = msg_send![seg, selectedSegment];
+                let ns_str_val = |ptr: usize| -> String {
+                    let v: id = msg_send![ptr as id, stringValue]; ns_str(v)
+                };
+                let (key, model, url) = if prov == 0 {
+                    (ns_str_val(ptrs.groq_api_fld),
+                     ns_str_val(ptrs.groq_mdl_fld),
+                     ns_str_val(ptrs.groq_url_fld))
+                } else {
+                    let base = ns_str_val(ptrs.loc_url_fld);
+                    let full = format!("{}/chat/completions", base.trim_end_matches('/'));
+                    (ns_str_val(ptrs.loc_key_fld), ns_str_val(ptrs.loc_mdl_fld), full)
+                };
+                let status_ptr = ptrs.status_lbl;
+                agent::spawn(
+                    move || agent::test_connection(&key, &model, &url),
+                    move |result| {
+                        let msg = match result {
+                            Ok(()) => "✓ Connected".to_owned(),
+                            Err(e) => e,
+                        };
+                        let _: () = msg_send![status_ptr as id,
+                            setStringValue: NSString::alloc(nil).init_str(&msg)];
+                    },
+                );
+            }
+        }
+
+        // Save config and close model settings panel
+        extern "C" fn apply_settings(_: &Object, _: Sel, _: id) {
+            unsafe {
+                let Some(ptrs) = MS_PTRS.get() else { return };
+                let seg: id   = ptrs.provider_seg as id;
+                let prov: i64 = msg_send![seg, selectedSegment];
+                let ns_str_val = |ptr: usize| -> String {
+                    let v: id = msg_send![ptr as id, stringValue]; ns_str(v)
+                };
+                let mut cfg = POINTER_CONFIG.get().unwrap().lock().unwrap();
+                cfg.provider       = prov as u8;
+                cfg.groq_api_key   = ns_str_val(ptrs.groq_api_fld);
+                cfg.groq_model     = ns_str_val(ptrs.groq_mdl_fld);
+                cfg.groq_url       = ns_str_val(ptrs.groq_url_fld);
+                cfg.local_base_url = ns_str_val(ptrs.loc_url_fld);
+                cfg.local_api_key  = ns_str_val(ptrs.loc_key_fld);
+                cfg.local_model    = ns_str_val(ptrs.loc_mdl_fld);
+                save_config(&cfg);
+                drop(cfg);
+                let _: () = msg_send![model_win(), orderOut: nil as id];
+            }
+        }
+
+        ctrl_decl.add_method(sel!(pulse:),             pulse             as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(enterPressed:),      enter_pressed     as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(nextStepPressed:),   next_step_pressed as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(colorSelected:),     color_selected    as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(toggleSettings:),    toggle_settings   as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(openColorPanel:),    open_color_panel  as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(openModelSettings:), open_model_settings as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(providerChanged:),   provider_changed  as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(testConnection:),    test_connection   as extern "C" fn(&Object, Sel, id));
+        ctrl_decl.add_method(sel!(applySettings:),     apply_settings    as extern "C" fn(&Object, Sel, id));
         let ctrl_class = ctrl_decl.register();
         let ctrl: id = msg_send![ctrl_class, alloc];
         let ctrl: id = msg_send![ctrl, init];
@@ -1327,9 +1753,13 @@ fn main() {
         let hint_panel = build_hint_panel();
         HINT_WIN_PTR.set(hint_panel as usize).unwrap();
 
-        // ── Settings / colour picker dropdown ─────────────────────────────────
-        let settings_panel = build_settings_panel(ctrl);
-        SETTINGS_WIN_PTR.set(settings_panel as usize).unwrap();
+        // ── Colour picker panel ───────────────────────────────────────────────
+        let color_panel = build_color_panel(ctrl);
+        COLOR_WIN_PTR.set(color_panel as usize).unwrap();
+
+        // ── Model settings panel ──────────────────────────────────────────────
+        let model_panel = build_model_settings_panel(ctrl);
+        MODEL_WIN_PTR.set(model_panel as usize).unwrap();
 
         // ── 50 ms animation timer ─────────────────────────────────────────────
         let _: id = msg_send![class!(NSTimer),
