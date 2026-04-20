@@ -197,23 +197,26 @@ fn main() {
             unsafe {
                 let Some(ptrs) = MS_PTRS.get() else { return };
                 let cfg = POINTER_CONFIG.get().unwrap().lock().unwrap().clone();
-                let _: () = msg_send![ptrs.provider_seg as id,
-                    setSelectedSegment: cfg.provider as i64];
+                let _: () = msg_send![ptrs.provider_popup as id,
+                    selectItemAtIndex: cfg.provider as i64];
                 let set_val = |ptr: usize, s: &str| {
                     let _: () = msg_send![ptr as id,
                         setStringValue: NSString::alloc(nil).init_str(s)];
                 };
-                set_val(ptrs.groq_api_fld, &cfg.groq_api_key);
-                set_val(ptrs.groq_mdl_fld, &cfg.groq_model);
-                set_val(ptrs.groq_url_fld, &cfg.groq_url);
-                set_val(ptrs.loc_url_fld,  &cfg.local_base_url);
-                set_val(ptrs.loc_key_fld,  &cfg.local_api_key);
-                set_val(ptrs.loc_mdl_fld,  &cfg.local_model);
-                set_val(ptrs.status_lbl,   "");
-                let _: () = msg_send![ptrs.groq_box as id,
-                    setHidden: if cfg.provider == 0 { NO } else { YES }];
-                let _: () = msg_send![ptrs.loc_box as id,
-                    setHidden: if cfg.provider == 0 { YES } else { NO }];
+                set_val(ptrs.groq_api_fld,  &cfg.groq_api_key);
+                set_val(ptrs.groq_mdl_fld,  &cfg.groq_model);
+                set_val(ptrs.groq_url_fld,  &cfg.groq_url);
+                set_val(ptrs.or_api_fld,    &cfg.openrouter_api_key);
+                set_val(ptrs.or_mdl_fld,    &cfg.openrouter_model);
+                set_val(ptrs.or_url_fld,    &cfg.openrouter_url);
+                set_val(ptrs.loc_url_fld,   &cfg.local_base_url);
+                set_val(ptrs.loc_key_fld,   &cfg.local_api_key);
+                set_val(ptrs.loc_mdl_fld,   &cfg.local_model);
+                set_val(ptrs.status_lbl,    "");
+                let p = cfg.provider;
+                let _: () = msg_send![ptrs.groq_box as id, setHidden: if p == 0 { NO } else { YES }];
+                let _: () = msg_send![ptrs.or_box   as id, setHidden: if p == 1 { NO } else { YES }];
+                let _: () = msg_send![ptrs.loc_box  as id, setHidden: if p == 2 { NO } else { YES }];
                 let _: () = msg_send![model_win(), center];
                 let _: () = msg_send![model_win(), makeKeyAndOrderFront: nil as id];
             }
@@ -221,12 +224,11 @@ fn main() {
 
         extern "C" fn provider_changed(_: &Object, _: Sel, sender: id) {
             unsafe {
-                let sel: i64 = msg_send![sender, selectedSegment];
+                let idx: i64 = msg_send![sender, indexOfSelectedItem];
                 if let Some(ptrs) = MS_PTRS.get() {
-                    let _: () = msg_send![ptrs.groq_box as id,
-                        setHidden: if sel == 0 { NO } else { YES }];
-                    let _: () = msg_send![ptrs.loc_box as id,
-                        setHidden: if sel == 0 { YES } else { NO }];
+                    let _: () = msg_send![ptrs.groq_box as id, setHidden: if idx == 0 { NO } else { YES }];
+                    let _: () = msg_send![ptrs.or_box   as id, setHidden: if idx == 1 { NO } else { YES }];
+                    let _: () = msg_send![ptrs.loc_box  as id, setHidden: if idx == 2 { NO } else { YES }];
                 }
             }
         }
@@ -236,22 +238,28 @@ fn main() {
                 let Some(ptrs) = MS_PTRS.get() else { return };
                 let _: () = msg_send![ptrs.status_lbl as id,
                     setStringValue: NSString::alloc(nil).init_str("Testing…")];
-                let seg: id   = ptrs.provider_seg as id;
-                let prov: i64 = msg_send![seg, selectedSegment];
+                let popup: id  = ptrs.provider_popup as id;
+                let prov: i64  = msg_send![popup, indexOfSelectedItem];
                 let ns_str_val = |ptr: usize| -> String {
                     let v: id = msg_send![ptr as id, stringValue];
                     ns_str(v)
                 };
-                let (key, model, url) = if prov == 0 {
-                    (
+                let (key, model, url) = match prov {
+                    1 => (
+                        ns_str_val(ptrs.or_api_fld),
+                        ns_str_val(ptrs.or_mdl_fld),
+                        ns_str_val(ptrs.or_url_fld),
+                    ),
+                    2 => {
+                        let base = ns_str_val(ptrs.loc_url_fld);
+                        let full = format!("{}/chat/completions", base.trim_end_matches('/'));
+                        (ns_str_val(ptrs.loc_key_fld), ns_str_val(ptrs.loc_mdl_fld), full)
+                    }
+                    _ => (
                         ns_str_val(ptrs.groq_api_fld),
                         ns_str_val(ptrs.groq_mdl_fld),
                         ns_str_val(ptrs.groq_url_fld),
-                    )
-                } else {
-                    let base = ns_str_val(ptrs.loc_url_fld);
-                    let full = format!("{}/chat/completions", base.trim_end_matches('/'));
-                    (ns_str_val(ptrs.loc_key_fld), ns_str_val(ptrs.loc_mdl_fld), full)
+                    ),
                 };
                 let status_ptr = ptrs.status_lbl;
                 agent::spawn(
@@ -271,20 +279,23 @@ fn main() {
         extern "C" fn apply_settings(_: &Object, _: Sel, _: id) {
             unsafe {
                 let Some(ptrs) = MS_PTRS.get() else { return };
-                let seg: id   = ptrs.provider_seg as id;
-                let prov: i64 = msg_send![seg, selectedSegment];
+                let popup: id  = ptrs.provider_popup as id;
+                let prov: i64  = msg_send![popup, indexOfSelectedItem];
                 let ns_str_val = |ptr: usize| -> String {
                     let v: id = msg_send![ptr as id, stringValue];
                     ns_str(v)
                 };
                 let mut cfg = POINTER_CONFIG.get().unwrap().lock().unwrap();
-                cfg.provider       = prov as u8;
-                cfg.groq_api_key   = ns_str_val(ptrs.groq_api_fld);
-                cfg.groq_model     = ns_str_val(ptrs.groq_mdl_fld);
-                cfg.groq_url       = ns_str_val(ptrs.groq_url_fld);
-                cfg.local_base_url = ns_str_val(ptrs.loc_url_fld);
-                cfg.local_api_key  = ns_str_val(ptrs.loc_key_fld);
-                cfg.local_model    = ns_str_val(ptrs.loc_mdl_fld);
+                cfg.provider            = prov as u8;
+                cfg.groq_api_key        = ns_str_val(ptrs.groq_api_fld);
+                cfg.groq_model          = ns_str_val(ptrs.groq_mdl_fld);
+                cfg.groq_url            = ns_str_val(ptrs.groq_url_fld);
+                cfg.openrouter_api_key  = ns_str_val(ptrs.or_api_fld);
+                cfg.openrouter_model    = ns_str_val(ptrs.or_mdl_fld);
+                cfg.openrouter_url      = ns_str_val(ptrs.or_url_fld);
+                cfg.local_base_url      = ns_str_val(ptrs.loc_url_fld);
+                cfg.local_api_key       = ns_str_val(ptrs.loc_key_fld);
+                cfg.local_model         = ns_str_val(ptrs.loc_mdl_fld);
                 save_config(&cfg);
                 drop(cfg);
                 let _: () = msg_send![model_win(), orderOut: nil as id];

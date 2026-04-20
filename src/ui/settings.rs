@@ -71,11 +71,21 @@ pub unsafe fn build_color_panel(ctrl: id) -> id {
 }
 
 // ── Model-settings panel ──────────────────────────────────────────────────────
+//
+// Layout (y from bottom, AppKit origin):
+//   12  buttons (h=28)
+//   48  status label (h=14)
+//   70  bottom separator
+//   72  provider boxes start (h=150, same frame for all — only one visible)
+//   230 top separator
+//   237 provider popup (h=22)
+//   265 "PROVIDER" label (h=13)
+//   Panel: 360 × 290
 
 pub unsafe fn build_model_settings_panel(ctrl: id) -> id {
     let panel: id = msg_send![class!(NSPanel), alloc];
     let panel: id = msg_send![panel,
-        initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(360.0, 284.0))
+        initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(360.0, 290.0))
         styleMask: 3u64 backing: 2u64 defer: NO
     ];
     let _: () = msg_send![panel, setTitle: NSString::alloc(nil).init_str("Model Settings")];
@@ -87,6 +97,8 @@ pub unsafe fn build_model_settings_panel(ctrl: id) -> id {
     let content: id = msg_send![panel, contentView];
     let pad = 20.0_f64;
     let fw  = 360.0 - pad * 2.0;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     let make_label = |y: f64, h: f64, text: &str, bold: bool| -> id {
         let f: id = msg_send![class!(NSTextField), alloc];
@@ -121,66 +133,89 @@ pub unsafe fn build_model_settings_panel(ctrl: id) -> id {
         let _: () = msg_send![cell, setPlaceholderString: NSString::alloc(nil).init_str(ph)];
         f
     };
+    // A provider-field box: inner view sized to hold 3 label+field rows (h=150).
+    // Rows from top-of-box (offset from box's y=0):
+    //   row0 top: y=127 label, y=105 field
+    //   row1 top: y=82  label, y=60  field
+    //   row2 top: y=37  label, y=15  field
+    let make_box = || -> id {
+        let v: id = msg_send![class!(NSView), alloc];
+        let v: id = msg_send![v,
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 72.0), NSSize::new(360.0, 150.0))
+        ];
+        v
+    };
 
-    // Provider segment
-    let _: () = msg_send![content, addSubview: make_label(259.0, 13.0, "PROVIDER", false)];
-    let seg: id = msg_send![class!(NSSegmentedControl), alloc];
-    let seg: id = msg_send![seg,
-        initWithFrame: NSRect::new(NSPoint::new(pad, 231.0), NSSize::new(fw, 24.0))
+    // ── Provider label + popup ────────────────────────────────────────────────
+
+    let _: () = msg_send![content, addSubview: make_label(265.0, 13.0, "PROVIDER", false)];
+
+    let popup: id = msg_send![class!(NSPopUpButton), alloc];
+    let popup: id = msg_send![popup,
+        initWithFrame: NSRect::new(NSPoint::new(pad, 237.0), NSSize::new(fw, 22.0))
+        pullsDown: NO
     ];
-    let _: () = msg_send![seg, setSegmentCount: 2_i64];
-    let _: () = msg_send![seg, setLabel: NSString::alloc(nil).init_str("Groq") forSegment: 0_i64];
-    let _: () = msg_send![seg,
-        setLabel: NSString::alloc(nil).init_str("Local / Self-hosted") forSegment: 1_i64];
-    let _: () = msg_send![seg, setSelectedSegment: 0_i64];
-    let _: () = msg_send![seg, setTrackingMode: 1_i64];
-    let _: () = msg_send![seg, setAction: sel!(providerChanged:)];
-    let _: () = msg_send![seg, setTarget: ctrl];
-    let _: () = msg_send![content, addSubview: seg];
+    let _: () = msg_send![popup, addItemWithTitle: NSString::alloc(nil).init_str("Groq")];
+    let _: () = msg_send![popup, addItemWithTitle: NSString::alloc(nil).init_str("OpenRouter")];
+    let _: () = msg_send![popup, addItemWithTitle: NSString::alloc(nil).init_str("Local / Self-hosted")];
+    let _: () = msg_send![popup, setAction: sel!(providerChanged:)];
+    let _: () = msg_send![popup, setTarget: ctrl];
+    let _: () = msg_send![content, addSubview: popup];
 
     // Top separator
     let sep_top: id = msg_send![class!(NSBox), alloc];
     let sep_top: id = msg_send![sep_top,
-        initWithFrame: NSRect::new(NSPoint::new(pad, 223.0), NSSize::new(fw, 1.0))
+        initWithFrame: NSRect::new(NSPoint::new(pad, 230.0), NSSize::new(fw, 1.0))
     ];
     let _: () = msg_send![sep_top, setBoxType: 2_i64];
     let _: () = msg_send![content, addSubview: sep_top];
 
-    // Groq fields
-    let groq_box: id = msg_send![class!(NSView), alloc];
-    let groq_box: id = msg_send![groq_box,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 73.0), NSSize::new(360.0, 148.0))
-    ];
-    let _: () = msg_send![groq_box, addSubview: make_label(135.0, 11.0, "API KEY", false)];
-    let groq_api = make_field(113.0, "gsk_…");
+    // ── Groq box (provider=0) ─────────────────────────────────────────────────
+
+    let groq_box = make_box();
+    let _: () = msg_send![groq_box, addSubview: make_label(127.0, 11.0, "API KEY", false)];
+    let groq_api = make_field(105.0, "gsk_…");
     let _: () = msg_send![groq_box, addSubview: groq_api];
-    let _: () = msg_send![groq_box, addSubview: make_label(90.0, 11.0, "MODEL", false)];
-    let groq_mdl = make_field(68.0, agent::GROQ_MODEL_DEFAULT);
+    let _: () = msg_send![groq_box, addSubview: make_label(82.0, 11.0, "MODEL", false)];
+    let groq_mdl = make_field(60.0, agent::GROQ_MODEL_DEFAULT);
     let _: () = msg_send![groq_box, addSubview: groq_mdl];
-    let _: () = msg_send![groq_box, addSubview: make_label(45.0, 11.0, "API URL", false)];
-    let groq_url = make_field(23.0, agent::GROQ_URL_DEFAULT);
+    let _: () = msg_send![groq_box, addSubview: make_label(37.0, 11.0, "API URL", false)];
+    let groq_url = make_field(15.0, agent::GROQ_URL_DEFAULT);
     let _: () = msg_send![groq_box, addSubview: groq_url];
     let _: () = msg_send![content, addSubview: groq_box];
 
-    // Local / self-hosted fields (hidden by default)
-    let loc_box: id = msg_send![class!(NSView), alloc];
-    let loc_box: id = msg_send![loc_box,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 73.0), NSSize::new(360.0, 148.0))
-    ];
+    // ── OpenRouter box (provider=1, hidden by default) ────────────────────────
+
+    let or_box = make_box();
+    let _: () = msg_send![or_box, setHidden: YES];
+    let _: () = msg_send![or_box, addSubview: make_label(127.0, 11.0, "API KEY", false)];
+    let or_api = make_field(105.0, "sk-or-v1-…");
+    let _: () = msg_send![or_box, addSubview: or_api];
+    let _: () = msg_send![or_box, addSubview: make_label(82.0, 11.0, "MODEL", false)];
+    let or_mdl = make_field(60.0, agent::OPENROUTER_MODEL_DEFAULT);
+    let _: () = msg_send![or_box, addSubview: or_mdl];
+    let _: () = msg_send![or_box, addSubview: make_label(37.0, 11.0, "API URL", false)];
+    let or_url = make_field(15.0, agent::OPENROUTER_URL_DEFAULT);
+    let _: () = msg_send![or_box, addSubview: or_url];
+    let _: () = msg_send![content, addSubview: or_box];
+
+    // ── Local / Self-hosted box (provider=2, hidden by default) ──────────────
+
+    let loc_box = make_box();
     let _: () = msg_send![loc_box, setHidden: YES];
-    let _: () = msg_send![loc_box, addSubview: make_label(135.0, 11.0, "BASE URL", false)];
-    let loc_url = make_field(113.0, agent::UITARS_URL_EXAMPLE);
+    let _: () = msg_send![loc_box, addSubview: make_label(127.0, 11.0, "BASE URL", false)];
+    let loc_url = make_field(105.0, agent::UITARS_URL_EXAMPLE);
     let _: () = msg_send![loc_box, addSubview: loc_url];
-    let _: () = msg_send![loc_box,
-        addSubview: make_label(90.0, 11.0, "API KEY (use EMPTY if none)", false)];
-    let loc_key = make_field(68.0, "EMPTY");
+    let _: () = msg_send![loc_box, addSubview: make_label(82.0, 11.0, "API KEY (use EMPTY if none)", false)];
+    let loc_key = make_field(60.0, "EMPTY");
     let _: () = msg_send![loc_box, addSubview: loc_key];
-    let _: () = msg_send![loc_box, addSubview: make_label(45.0, 11.0, "MODEL NAME", false)];
-    let loc_mdl = make_field(23.0, agent::UITARS_MODEL_EXAMPLE);
+    let _: () = msg_send![loc_box, addSubview: make_label(37.0, 11.0, "MODEL NAME", false)];
+    let loc_mdl = make_field(15.0, agent::UITARS_MODEL_EXAMPLE);
     let _: () = msg_send![loc_box, addSubview: loc_mdl];
     let _: () = msg_send![content, addSubview: loc_box];
 
-    // Bottom separator
+    // ── Bottom separator ──────────────────────────────────────────────────────
+
     let sep_bot: id = msg_send![class!(NSBox), alloc];
     let sep_bot: id = msg_send![sep_bot,
         initWithFrame: NSRect::new(NSPoint::new(pad, 67.0), NSSize::new(fw, 1.0))
@@ -188,7 +223,8 @@ pub unsafe fn build_model_settings_panel(ctrl: id) -> id {
     let _: () = msg_send![sep_bot, setBoxType: 2_i64];
     let _: () = msg_send![content, addSubview: sep_bot];
 
-    // Status label
+    // ── Status label ──────────────────────────────────────────────────────────
+
     let status: id = msg_send![class!(NSTextField), alloc];
     let status: id = msg_send![status,
         initWithFrame: NSRect::new(NSPoint::new(pad, 48.0), NSSize::new(fw, 14.0))
@@ -204,7 +240,8 @@ pub unsafe fn build_model_settings_panel(ctrl: id) -> id {
     let _: () = msg_send![status, setStringValue: NSString::alloc(nil).init_str("")];
     let _: () = msg_send![content, addSubview: status];
 
-    // Test Connection button
+    // ── Buttons ───────────────────────────────────────────────────────────────
+
     let test_btn: id = msg_send![class!(NSButton), alloc];
     let test_btn: id = msg_send![test_btn,
         initWithFrame: NSRect::new(NSPoint::new(pad, 12.0), NSSize::new(148.0, 28.0))
@@ -215,7 +252,6 @@ pub unsafe fn build_model_settings_panel(ctrl: id) -> id {
     let _: () = msg_send![test_btn, setTarget: ctrl];
     let _: () = msg_send![content, addSubview: test_btn];
 
-    // Apply button
     let apply_btn: id = msg_send![class!(NSButton), alloc];
     let apply_btn: id = msg_send![apply_btn,
         initWithFrame: NSRect::new(NSPoint::new(192.0, 12.0), NSSize::new(148.0, 28.0))
@@ -227,18 +263,24 @@ pub unsafe fn build_model_settings_panel(ctrl: id) -> id {
     let _: () = msg_send![apply_btn, setTarget: ctrl];
     let _: () = msg_send![content, addSubview: apply_btn];
 
+    // ── Store pointers ────────────────────────────────────────────────────────
+
     use crate::config::MsPtrs;
     MS_PTRS.set(MsPtrs {
-        provider_seg: seg      as usize,
-        groq_api_fld: groq_api as usize,
-        groq_mdl_fld: groq_mdl as usize,
-        groq_url_fld: groq_url as usize,
-        loc_url_fld:  loc_url  as usize,
-        loc_key_fld:  loc_key  as usize,
-        loc_mdl_fld:  loc_mdl  as usize,
-        groq_box:     groq_box as usize,
-        loc_box:      loc_box  as usize,
-        status_lbl:   status   as usize,
+        provider_popup: popup    as usize,
+        groq_api_fld:   groq_api as usize,
+        groq_mdl_fld:   groq_mdl as usize,
+        groq_url_fld:   groq_url as usize,
+        or_api_fld:     or_api   as usize,
+        or_mdl_fld:     or_mdl   as usize,
+        or_url_fld:     or_url   as usize,
+        loc_url_fld:    loc_url  as usize,
+        loc_key_fld:    loc_key  as usize,
+        loc_mdl_fld:    loc_mdl  as usize,
+        groq_box:       groq_box as usize,
+        or_box:         or_box   as usize,
+        loc_box:        loc_box  as usize,
+        status_lbl:     status   as usize,
     }).ok();
     panel
 }
