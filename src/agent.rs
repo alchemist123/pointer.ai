@@ -5,16 +5,27 @@ use std::process::Command;
 
 use crate::{log_ai, log_error, log_info};
 
-pub const GROQ_MODEL_DEFAULT:    &str = "meta-llama/llama-4-scout-17b-16e-instruct";
-pub const GROQ_URL_DEFAULT:      &str = "https://api.groq.com/openai/v1/chat/completions";
-pub const UITARS_MODEL_EXAMPLE:  &str = "bytedance-research/UI-TARS-7B-SFT";
-pub const UITARS_URL_EXAMPLE:    &str = "http://localhost:8000/v1/chat/completions";
+pub const GROQ_MODEL_DEFAULT:        &str = "meta-llama/llama-4-scout-17b-16e-instruct";
+pub const GROQ_URL_DEFAULT:          &str = "https://api.groq.com/openai/v1/chat/completions";
+pub const OPENROUTER_URL_DEFAULT:    &str = "https://openrouter.ai/api/v1/chat/completions";
+pub const OPENROUTER_MODEL_DEFAULT:  &str = "meta-llama/llama-4-maverick:free";
+pub const UITARS_MODEL_EXAMPLE:      &str = "bytedance-research/UI-TARS-7B-SFT";
+pub const UITARS_URL_EXAMPLE:        &str = "http://localhost:8000/v1/chat/completions";
 
 // ── UI-TARS detection ─────────────────────────────────────────────────────────
 
 fn is_uitars_model(model: &str) -> bool {
     let m = model.to_lowercase();
     m.contains("ui-tars") || m.contains("uitars")
+}
+
+fn is_reasoning_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    // Known thinking/reasoning model families that burn tokens on CoT before output.
+    m.contains("qwq") || m.contains("qwen3") || m.contains("deepseek-r")
+        || m.contains("o1") || m.contains("o3") || m.contains("o4")
+        || m.contains("reasoning") || m.contains("thinking")
+        || m.contains("r1") || m.contains("r2")
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -120,44 +131,50 @@ pub fn test_connection(api_key: &str, model: &str, url: &str) -> Result<(), Stri
         "temperature": 0
     }).to_string();
 
-    // Send a plain-text message first to verify auth + endpoint.
-    // Then send a vision probe to check image support.
     const TEST_PATH: &str = "/tmp/pointer_test_body.json";
     std::fs::write(TEST_PATH, &body).map_err(|e| format!("✗ write body: {e}"))?;
-    let out = Command::new("curl")
-        .args([
-            "-s", "-w", "\n%{http_code}",
-            "--connect-timeout", "8",
-            "-X", "POST", url,
-            "-H", "Content-Type: application/json",
-            "-H", &format!("Authorization: Bearer {api_key}"),
-            "--data-binary", &format!("@{TEST_PATH}"),
-        ])
-        .output()
+
+    let extra_headers = openrouter_headers(url);
+    let auth_header   = format!("Authorization: Bearer {api_key}");
+    let data_arg      = format!("@{TEST_PATH}");
+    let mut args = vec![
+        "-s", "-w", "\n%{http_code}",
+        "--connect-timeout", "8",
+        "-X", "POST", url,
+        "-H", "Content-Type: application/json",
+        "-H", &auth_header,
+    ];
+    for h in &extra_headers { args.extend(["-H", h.as_str()]); }
+    args.extend(["--data-binary", &data_arg]);
+
+    let out = Command::new("curl").args(&args).output()
         .map_err(|e| format!("✗ {e}"))?;
 
-    let raw = String::from_utf8_lossy(&out.stdout);
+    let raw    = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // Last line is the HTTP status code (from -w "\n%{http_code}").
     let (resp_body, status_line) = raw.rsplit_once('\n').unwrap_or(("", raw.trim()));
     let code = status_line.trim().parse::<u16>().unwrap_or(0);
 
     match code {
         401 | 403 => return Err("✗ Invalid API key".into()),
-        404       => return Err("✗ Model not found — update model name".into()),
+        404       => return Err("✗ Model not found — check model name".into()),
         0         => {
             let detail = stderr.trim();
             return Err(if detail.is_empty() {
                 "✗ Could not connect to server".into()
             } else {
-                format!("✗ {}", &detail[..detail.len().min(80)])
+                format!("✗ {}", &detail[..detail.len().min(120)])
             });
         }
-        c if c != 200 && c != 201 => return Err(format!("✗ HTTP {c}")),
+        c if c != 200 && c != 201 => {
+            // Extract the API's own error message from the body.
+            let api_msg = api_error_message(resp_body);
+            return Err(format!("✗ HTTP {c}{api_msg}"));
+        }
         _ => {}
     }
 
-    // Now probe vision support with a 1×1 transparent PNG.
+    // Vision probe — 1×1 transparent PNG.
     let vision_body = serde_json::json!({
         "model": model,
         "messages": [{"role":"user","content":[
@@ -170,25 +187,58 @@ pub fn test_connection(api_key: &str, model: &str, url: &str) -> Result<(), Stri
         "temperature": 0
     }).to_string();
     std::fs::write(TEST_PATH, &vision_body).map_err(|e| format!("✗ write body: {e}"))?;
-    let vout = Command::new("curl")
-        .args([
-            "-s", "--connect-timeout", "8",
-            "-X", "POST", url,
-            "-H", "Content-Type: application/json",
-            "-H", &format!("Authorization: Bearer {api_key}"),
-            "--data-binary", &format!("@{TEST_PATH}"),
-        ])
-        .output()
+
+    let vdata_arg = format!("@{TEST_PATH}");
+    let mut vargs = vec![
+        "-s", "--connect-timeout", "8",
+        "-X", "POST", url,
+        "-H", "Content-Type: application/json",
+        "-H", &auth_header,
+    ];
+    for h in &extra_headers { vargs.extend(["-H", h.as_str()]); }
+    vargs.extend(["--data-binary", &vdata_arg]);
+
+    let vout = Command::new("curl").args(&vargs).output()
         .map_err(|e| format!("✗ {e}"))?;
     let vraw = String::from_utf8_lossy(&vout.stdout);
-    if vraw.contains("must be a string") || vraw.contains("does not support") {
+    if vraw.contains("must be a string") || vraw.contains("does not support")
+        || vraw.contains("image") && vraw.contains("not supported")
+    {
         return Err(format!(
-            "✗ '{model}' is text-only — use a vision model e.g. meta-llama/llama-4-scout-17b-16e-instruct"
+            "✗ '{model}' is text-only — choose a vision-capable model"
         ));
     }
 
-    let _ = resp_body; // text check passed
+    let _ = resp_body;
     Ok(())
+}
+
+/// Returns extra headers required by OpenRouter (empty for other providers).
+fn openrouter_headers(url: &str) -> Vec<String> {
+    if url.contains("openrouter") {
+        vec![
+            "HTTP-Referer: https://pointer.app".into(),
+            "X-Title: Pointer".into(),
+        ]
+    } else {
+        vec![]
+    }
+}
+
+/// Extracts a short human-readable error message from an API JSON error body.
+fn api_error_message(body: &str) -> String {
+    // Try {"error":{"message":"..."}} (OpenAI / OpenRouter / Groq format).
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        let msg = v.pointer("/error/message")
+            .or_else(|| v.pointer("/message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        if !msg.is_empty() {
+            let short = &msg[..msg.len().min(120)];
+            return format!(" — {short}");
+        }
+    }
+    String::new()
 }
 
 // ── Screenshot ────────────────────────────────────────────────────────────────
@@ -197,20 +247,33 @@ fn capture_screenshot(logical_w: u32, logical_h: u32) -> Result<(String, u32, u3
     const PATH: &str = "/tmp/pointer_tour_ss.png";
     Command::new("screencapture").args(["-x", "-m", "-t", "png", PATH])
         .status().map_err(|e| format!("screencapture: {e}"))?;
-    // Don't downscale — send the native resolution (Retina = 2x) to the AI so
-    // it has maximum pixel detail for accurate element targeting. The coordinate
-    // scaling in next_step handles the physical→logical conversion via
-    // raw.x * (screen_w / img_w).
+
     let info = Command::new("sips").args(["-g", "pixelWidth", "-g", "pixelHeight", PATH])
         .output().map_err(|e| format!("sips info: {e}"))?;
     let info_s = String::from_utf8_lossy(&info.stdout);
     let actual_w = parse_sips_dim(&info_s, "pixelWidth").unwrap_or(logical_w);
     let actual_h = parse_sips_dim(&info_s, "pixelHeight").unwrap_or(logical_h);
-    log_info!("screenshot {actual_w}×{actual_h} (logical {logical_w}×{logical_h})");
+
+    // Downscale Retina screenshots to logical resolution before sending to the AI.
+    // Vision models are trained on typical screen resolutions; sending a 2x Retina
+    // image causes them to return coordinates in logical space (e.g. 1440×900) even
+    // though the image is 2880×1800, producing 2x positional errors. At logical
+    // resolution the AI's pixel coordinates map directly to AppKit logical points
+    // with no scaling needed, eliminating the mismatch entirely.
+    let (send_w, send_h) = if actual_w > logical_w {
+        let w_str = logical_w.to_string();
+        Command::new("sips").args(["--resampleWidth", &w_str, PATH])
+            .status().ok();
+        (logical_w, logical_h)
+    } else {
+        (actual_w, actual_h)
+    };
+
+    log_info!("screenshot {actual_w}×{actual_h} → {send_w}×{send_h} sent to AI");
     let mut bytes = Vec::new();
     std::fs::File::open(PATH).map_err(|e| format!("open screenshot: {e}"))?
         .read_to_end(&mut bytes).map_err(|e| format!("read screenshot: {e}"))?;
-    Ok((B64.encode(&bytes), actual_w, actual_h))
+    Ok((B64.encode(&bytes), send_w, send_h))
 }
 
 fn parse_sips_dim(output: &str, key: &str) -> Option<u32> {
@@ -223,12 +286,13 @@ fn parse_sips_dim(output: &str, key: &str) -> Option<u32> {
 // ── Groq API ──────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)] struct GroqResp   { choices: Vec<GroqChoice> }
-#[derive(Deserialize)] struct GroqChoice { message: GroqMsg }
-#[derive(Deserialize)] struct GroqMsg    { content: String }
+#[derive(Deserialize)] struct GroqChoice { message: GroqMsg, #[serde(default)] finish_reason: String }
+#[derive(Deserialize)] struct GroqMsg    { #[serde(default)] content: Option<String> }
 
 #[derive(Deserialize)]
 struct StepJson {
-    x: f64, y: f64,
+    #[serde(default)] x: f64,
+    #[serde(default)] y: f64,
     action: String, description: String,
     #[serde(default)] reason: String,
     #[serde(default)] is_final: bool,
@@ -454,7 +518,7 @@ fn query_groq_once(
             "Task: {goal}\nApp: {app}\nWindow: {window}\n{url_line}\
              Steps done:\n{history_text}\n{extra_hint}"
         );
-        (UITARS_SYSTEM_PROMPT, text, 256usize)
+        (UITARS_SYSTEM_PROMPT, text, 512usize)
     } else {
         let text = format!(
             "app:    {app}\nwindow: {window}\n{url_line}goal:   {goal}\n\n\
@@ -464,7 +528,10 @@ fn query_groq_once(
              Identify the single next UI element and return its centre pixel.{extra_hint}",
             img_w-1.0, img_h-1.0
         );
-        (SYSTEM_PROMPT, text, 512usize)
+        // Reasoning/thinking models consume tokens internally before writing the
+        // answer — 4096 ensures they finish the chain-of-thought and still output JSON.
+        let tokens = if is_reasoning_model(model) { 4096usize } else { 1024usize };
+        (SYSTEM_PROMPT, text, tokens)
     };
 
     let body = serde_json::json!({
@@ -480,16 +547,20 @@ fn query_groq_once(
         "max_tokens": max_tokens
     }).to_string();
 
-    // Write body to a temp file — the base64 screenshot can be several MB,
-    // which exceeds ARG_MAX if passed as a shell argument via -d.
     const BODY_PATH: &str = "/tmp/pointer_body.json";
     std::fs::write(BODY_PATH, &body).map_err(|e| format!("write body: {e}"))?;
-    let out = Command::new("curl")
-        .args(["-s","-X","POST", api_url,
-               "-H","Content-Type: application/json",
-               "-H",&format!("Authorization: Bearer {api_key}"),
-               "--data-binary", &format!("@{BODY_PATH}")])
-        .output().map_err(|e| format!("curl: {e}"))?;
+    let extra_headers = openrouter_headers(api_url);
+    let auth_header   = format!("Authorization: Bearer {api_key}");
+    let data_arg      = format!("@{BODY_PATH}");
+    let mut args = vec![
+        "-s", "-X", "POST", api_url,
+        "-H", "Content-Type: application/json",
+        "-H", &auth_header,
+    ];
+    for h in &extra_headers { args.extend(["-H", h.as_str()]); }
+    args.extend(["--data-binary", &data_arg]);
+    let out = Command::new("curl").args(&args).output()
+        .map_err(|e| format!("curl: {e}"))?;
 
     let raw = String::from_utf8_lossy(&out.stdout);
     // Detect non-vision model and surface a clear error immediately.
@@ -509,7 +580,21 @@ fn query_groq_once(
     }
     let resp: GroqResp = serde_json::from_str(&raw)
         .map_err(|e| format!("Groq parse error: {e}\n---\n{raw}"))?;
-    let content = resp.choices.into_iter().next().ok_or("Groq: no choices")?.message.content;
+    let choice  = resp.choices.into_iter().next().ok_or("no choices in response")?;
+    let content = match choice.message.content {
+        Some(ref c) if !c.is_empty() => c.clone(),
+        _ => {
+            // content=null means the model ran out of tokens during chain-of-thought
+            // (reasoning models) or returned no output.
+            if choice.finish_reason == "length" {
+                return Err(format!(
+                    "model hit max_tokens mid-reasoning — try a smaller/faster model \
+                     or the response was cut short"
+                ));
+            }
+            return Err("model returned empty content".into());
+        }
+    };
     log_ai!("→ {content}");
 
     if uitars {
