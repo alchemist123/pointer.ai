@@ -7,6 +7,7 @@ use std::thread;
 
 use crate::state::*;
 use crate::tour::{on_next_step_pressed, to_hidden, to_loading, toggle};
+use crate::log_error;
 
 // ── Virtual-key codes ─────────────────────────────────────────────────────────
 
@@ -66,9 +67,9 @@ pub fn ensure_accessibility() {
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        eprintln!(
-            "\n[pointer] Accessibility not granted.\n  Add: {exe}\n  \
-             System Settings → Privacy & Security → Accessibility\n"
+        log_error!(
+            "Accessibility not granted — add '{exe}' in \
+             System Settings → Privacy & Security → Accessibility"
         );
         let key: id = NSString::alloc(nil).init_str("AXTrustedCheckOptionPrompt");
         let val: id = msg_send![class!(NSNumber), numberWithBool: YES];
@@ -170,9 +171,7 @@ pub fn run_event_tap() {
                 std::ptr::null(),
             );
             if tap.is_null() {
-                eprintln!(
-                    "[pointer] Event tap failed — grant Accessibility permission. Retrying in 2s…"
-                );
+                log_error!("event tap failed — grant Accessibility permission. Retrying in 2s…");
                 thread::sleep(std::time::Duration::from_secs(2));
                 continue;
             }

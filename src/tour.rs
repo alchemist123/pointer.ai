@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 
 use crate::agent::{self, AgentStep, TourAgent};
 use crate::state::*;
+use crate::{log_error, log_info};
 
 // ── Public state-machine wrappers ─────────────────────────────────────────────
 
@@ -132,10 +133,10 @@ pub unsafe fn to_loading_impl() {
         .unwrap_or_default();
     let url = agent::get_browser_url(&app);
 
-    println!("app:    {app}");
-    println!("window: {win}");
-    if let Some(ref u) = url { println!("url:    {u}"); }
-    println!("query:  {query}");
+    log_info!("app:    {app}");
+    log_info!("window: {win}");
+    if let Some(ref u) = url { log_info!("url:    {u}"); }
+    log_info!("query:  {query}");
 
     if let Some(m) = GOAL_TEXT.get()  { if let Ok(mut g) = m.lock() { *g = query.clone(); } }
     if let Some(m) = INPUT_TEXT.get() { if let Ok(mut g) = m.lock() { g.clear(); } }
@@ -184,13 +185,13 @@ pub fn fire_next_step() {
         Some(mut g) => match g.take() {
             Some(a) => a,
             None => {
-                eprintln!("[pointer] fire_next_step: agent is None — aborting");
+                log_error!("fire_next_step: agent is None — aborting");
                 to_hidden();
                 return;
             }
         },
         None => {
-            eprintln!("[pointer] fire_next_step: TOUR_AGENT not initialised");
+            log_error!("fire_next_step: TOUR_AGENT not initialised");
             return;
         }
     };
@@ -202,7 +203,7 @@ pub fn fire_next_step() {
             }
             match result {
                 Ok(step) => show_step(step),
-                Err(e)   => { eprintln!("[pointer] Agent error: {e}"); to_hidden(); }
+                Err(e)   => { log_error!("agent: {e}"); to_hidden(); }
             }
         },
     );

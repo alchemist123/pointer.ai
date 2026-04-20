@@ -169,14 +169,14 @@ pub unsafe fn build_model_settings_panel(ctrl: id) -> id {
     ];
     let _: () = msg_send![loc_box, setHidden: YES];
     let _: () = msg_send![loc_box, addSubview: make_label(135.0, 11.0, "BASE URL", false)];
-    let loc_url = make_field(113.0, "http://host:8000/v1");
+    let loc_url = make_field(113.0, agent::UITARS_URL_EXAMPLE);
     let _: () = msg_send![loc_box, addSubview: loc_url];
     let _: () = msg_send![loc_box,
         addSubview: make_label(90.0, 11.0, "API KEY (use EMPTY if none)", false)];
     let loc_key = make_field(68.0, "EMPTY");
     let _: () = msg_send![loc_box, addSubview: loc_key];
     let _: () = msg_send![loc_box, addSubview: make_label(45.0, 11.0, "MODEL NAME", false)];
-    let loc_mdl = make_field(23.0, "llama-3…");
+    let loc_mdl = make_field(23.0, agent::UITARS_MODEL_EXAMPLE);
     let _: () = msg_send![loc_box, addSubview: loc_mdl];
     let _: () = msg_send![content, addSubview: loc_box];
 

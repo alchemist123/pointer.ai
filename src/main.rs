@@ -3,6 +3,7 @@
 mod agent;
 mod config;
 mod events;
+pub mod logger;
 mod state;
 mod tour;
 mod ui;
@@ -32,6 +33,7 @@ fn main() {
         let menu: id = msg_send![class!(NSMenu), new];
         let _: () = msg_send![app, setMainMenu: menu];
 
+        logger::init();
         events::ensure_accessibility();
 
         POINTER_CONFIG.set(Mutex::new(load_config())).unwrap();
