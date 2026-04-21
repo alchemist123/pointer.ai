@@ -21,6 +21,59 @@ pub fn to_hidden()  { unsafe { to_hidden_impl()  } }
 pub fn to_input()   { unsafe { to_input_impl()   } }
 pub fn to_loading() { unsafe { to_loading_impl() } }
 
+// ── Cursor screen detection ───────────────────────────────────────────────────
+
+unsafe fn detect_cursor_screen(mouse: NSPoint) {
+    extern "C" {
+        fn CGGetActiveDisplayList(max_displays: u32, active_displays: *mut u32, display_count: *mut u32) -> i32;
+    }
+
+    // Primary screen is screens[0]; its height is needed for CG ↔ AppKit coord conversion.
+    let screens: id  = msg_send![class!(NSScreen), screens];
+    let primary: id  = msg_send![screens, objectAtIndex: 0usize];
+    let pf: NSRect   = msg_send![primary, frame];
+    SCREEN_H_LOGICAL.store(pf.size.height.to_bits(), Ordering::SeqCst);
+
+    // Display IDs in the same order that `screencapture -D N` uses (1-based).
+    let mut ids   = [0u32; 16];
+    let mut count = 0u32;
+    CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut count);
+
+    let n: usize = msg_send![screens, count];
+    for i in 0..n {
+        let screen: id = msg_send![screens, objectAtIndex: i];
+        let sf: NSRect = msg_send![screen, frame];
+
+        let in_x = mouse.x >= sf.origin.x && mouse.x < sf.origin.x + sf.size.width;
+        let in_y = mouse.y >= sf.origin.y && mouse.y < sf.origin.y + sf.size.height;
+        if !(in_x && in_y) { continue; }
+
+        // Map NSScreen → CGDirectDisplayID → 1-based screencapture -D index.
+        let desc: id    = msg_send![screen, deviceDescription];
+        let key: id     = NSString::alloc(nil).init_str("NSScreenNumber");
+        let num_obj: id = msg_send![desc, objectForKey: key];
+        let cg_id: u32  = msg_send![num_obj, unsignedIntValue];
+        let disp_idx = ids[..count as usize].iter()
+            .position(|&d| d == cg_id)
+            .map(|p| p + 1)
+            .unwrap_or(1) as u32;
+
+        CURSOR_SCREEN_ORIGIN_X.store(sf.origin.x.to_bits(),   Ordering::SeqCst);
+        CURSOR_SCREEN_ORIGIN_Y.store(sf.origin.y.to_bits(),   Ordering::SeqCst);
+        CURSOR_SCREEN_W.store(sf.size.width.to_bits(),        Ordering::SeqCst);
+        CURSOR_SCREEN_H.store(sf.size.height.to_bits(),       Ordering::SeqCst);
+        CURSOR_DISPLAY_IDX.store(disp_idx,                    Ordering::SeqCst);
+        return;
+    }
+
+    // Fallback: primary screen, display 1.
+    CURSOR_SCREEN_ORIGIN_X.store(0f64.to_bits(),              Ordering::SeqCst);
+    CURSOR_SCREEN_ORIGIN_Y.store(0f64.to_bits(),              Ordering::SeqCst);
+    CURSOR_SCREEN_W.store(pf.size.width.to_bits(),            Ordering::SeqCst);
+    CURSOR_SCREEN_H.store(pf.size.height.to_bits(),           Ordering::SeqCst);
+    CURSOR_DISPLAY_IDX.store(1,                               Ordering::SeqCst);
+}
+
 // ── Context capture ───────────────────────────────────────────────────────────
 
 pub unsafe fn focused_window_title(pid: i32) -> String {
@@ -73,6 +126,7 @@ pub unsafe fn capture_context() {
 pub unsafe fn to_dot() {
     capture_context();
     let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+    detect_cursor_screen(mouse);
     let _: () = msg_send![dot_win(),
         setFrame: NSRect::new(
             NSPoint::new(mouse.x - DOT_SZ / 2.0, mouse.y - DOT_SZ / 2.0),
@@ -133,6 +187,16 @@ pub unsafe fn to_loading_impl() {
         .unwrap_or_default();
     let url = agent::get_browser_url(&app);
 
+    let cfg_snapshot = POINTER_CONFIG.get().unwrap().lock().unwrap().clone();
+    let provider_name = match cfg_snapshot.provider {
+        1 => "OpenRouter",
+        2 => "Local",
+        _ => "Groq",
+    };
+    log_info!("provider: {provider_name}");
+    log_info!("key:      {}", cfg_snapshot.effective_api_key());
+    log_info!("model:    {}", cfg_snapshot.effective_model());
+    log_info!("url:      {}", cfg_snapshot.effective_api_url());
     log_info!("app:    {app}");
     log_info!("window: {win}");
     if let Some(ref u) = url { log_info!("url:    {u}"); }
@@ -149,7 +213,7 @@ pub unsafe fn to_loading_impl() {
     let _: () = msg_send![dot_win(), orderFrontRegardless];
     redraw_dot();
 
-    let cfg = POINTER_CONFIG.get().unwrap().lock().unwrap().clone();
+    let cfg = cfg_snapshot;
     if cfg.effective_api_key().is_empty() {
         APP_STATE.store(0, Ordering::SeqCst);
         let _: () = msg_send![in_panel(), orderOut: nil as id];
@@ -160,14 +224,18 @@ pub unsafe fn to_loading_impl() {
         return;
     }
 
-    let screens: id = msg_send![class!(NSScreen), screens];
-    let primary: id = msg_send![screens, objectAtIndex: 0usize];
-    let sf: NSRect  = msg_send![primary, frame];
+    // Cursor screen info captured in to_dot() via detect_cursor_screen().
+    let screen_origin_x = f64::from_bits(CURSOR_SCREEN_ORIGIN_X.load(Ordering::SeqCst));
+    let screen_origin_y = f64::from_bits(CURSOR_SCREEN_ORIGIN_Y.load(Ordering::SeqCst));
+    let screen_w        = f64::from_bits(CURSOR_SCREEN_W.load(Ordering::SeqCst));
+    let screen_h        = f64::from_bits(CURSOR_SCREEN_H.load(Ordering::SeqCst));
+    let display_idx     = CURSOR_DISPLAY_IDX.load(Ordering::SeqCst) as usize;
 
-    SCREEN_H_LOGICAL.store(sf.size.height.to_bits(), Ordering::SeqCst);
     let new_agent = TourAgent::new(
         query, app, win, url,
-        sf.size.width, sf.size.height,
+        screen_w, screen_h,
+        screen_origin_x, screen_origin_y,
+        display_idx,
         cfg.effective_api_key().to_owned(),
         cfg.effective_api_url(),
         cfg.effective_model().to_owned(),

@@ -64,31 +64,39 @@ pub fn get_browser_url(app: &str) -> Option<String> {
 
 #[derive(Debug)]
 pub struct TourAgent {
-    pub goal:     String,
-    pub app:      String,
-    pub window:   String,
-    pub url:      Option<String>,
-    pub screen_w: f64,
-    pub screen_h: f64,
-    pub api_key:  String,
-    pub api_url:  String,
-    pub model:    String,
-    history:      Vec<String>,
-    step_num:     usize,
+    pub goal:            String,
+    pub app:             String,
+    pub window:          String,
+    pub url:             Option<String>,
+    pub screen_w:        f64,
+    pub screen_h:        f64,
+    pub screen_origin_x: f64,
+    pub screen_origin_y: f64,
+    pub display_num:     usize,
+    pub api_key:         String,
+    pub api_url:         String,
+    pub model:           String,
+    history:             Vec<String>,
+    step_num:            usize,
 }
 
 impl TourAgent {
     pub fn new(
         goal: String, app: String, window: String, url: Option<String>,
         screen_w: f64, screen_h: f64,
+        screen_origin_x: f64, screen_origin_y: f64,
+        display_num: usize,
         api_key: String, api_url: String, model: String,
     ) -> Self {
         Self { goal, app, window, url, screen_w, screen_h,
+               screen_origin_x, screen_origin_y, display_num,
                api_key, api_url, model, history: Vec::new(), step_num: 0 }
     }
 
     pub fn next_step(&mut self) -> Result<AgentStep, String> {
-        let (b64, img_w, img_h) = capture_screenshot(self.screen_w as u32, self.screen_h as u32)?;
+        let (b64, img_w, img_h) = capture_screenshot(
+            self.screen_w as u32, self.screen_h as u32, self.display_num,
+        )?;
         let raw = query_groq(
             &self.goal, &self.app, &self.window, self.url.as_deref(),
             &self.history, &b64, img_w as f64, img_h as f64,
@@ -96,11 +104,18 @@ impl TourAgent {
         )?;
         self.step_num += 1;
         let n = self.step_num;
-        let lx   = raw.x * (self.screen_w / img_w as f64);
-        let ly   = raw.y * (self.screen_h / img_h as f64);
-        let ns_y = self.screen_h - ly;
+
+        // Scale from image pixels → logical points (no-op when image == logical res).
+        let lx = raw.x * (self.screen_w / img_w as f64);
+        let ly = raw.y * (self.screen_h / img_h as f64);
+
+        // Translate capture-relative logical coords to global AppKit coords.
+        // AppKit origin is bottom-left; AI image origin is top-left, y-down.
+        let ns_x = self.screen_origin_x + lx;
+        let ns_y = self.screen_origin_y + self.screen_h - ly;
+
         let step = AgentStep {
-            x: lx, y: ns_y,
+            x: ns_x, y: ns_y,
             action: raw.action.clone(), description: raw.description.clone(),
             reason: raw.reason.clone(),
             step_num: n, is_final: raw.is_final,
@@ -243,9 +258,10 @@ fn api_error_message(body: &str) -> String {
 
 // ── Screenshot ────────────────────────────────────────────────────────────────
 
-fn capture_screenshot(logical_w: u32, logical_h: u32) -> Result<(String, u32, u32), String> {
+fn capture_screenshot(logical_w: u32, logical_h: u32, display_num: usize) -> Result<(String, u32, u32), String> {
     const PATH: &str = "/tmp/pointer_tour_ss.png";
-    Command::new("screencapture").args(["-x", "-m", "-t", "png", PATH])
+    let d = display_num.to_string();
+    Command::new("screencapture").args(["-x", "-m", "-D", &d, "-t", "png", PATH])
         .status().map_err(|e| format!("screencapture: {e}"))?;
 
     let info = Command::new("sips").args(["-g", "pixelWidth", "-g", "pixelHeight", PATH])
@@ -528,9 +544,10 @@ fn query_groq_once(
              Identify the single next UI element and return its centre pixel.{extra_hint}",
             img_w-1.0, img_h-1.0
         );
-        // Reasoning/thinking models consume tokens internally before writing the
-        // answer — 4096 ensures they finish the chain-of-thought and still output JSON.
-        let tokens = if is_reasoning_model(model) { 4096usize } else { 1024usize };
+        // Reasoning/thinking models (Qwen3, DeepSeek-R1, o1…) consume thousands of
+        // tokens on chain-of-thought before writing the answer. 8192 gives enough
+        // headroom even after a long retry hint is appended to the prompt.
+        let tokens = if is_reasoning_model(model) { 8192usize } else { 1024usize };
         (SYSTEM_PROMPT, text, tokens)
     };
 
@@ -553,7 +570,8 @@ fn query_groq_once(
     let auth_header   = format!("Authorization: Bearer {api_key}");
     let data_arg      = format!("@{BODY_PATH}");
     let mut args = vec![
-        "-s", "-X", "POST", api_url,
+        "-s", "-w", "\n%{http_code}",
+        "-X", "POST", api_url,
         "-H", "Content-Type: application/json",
         "-H", &auth_header,
     ];
@@ -562,7 +580,26 @@ fn query_groq_once(
     let out = Command::new("curl").args(&args).output()
         .map_err(|e| format!("curl: {e}"))?;
 
-    let raw = String::from_utf8_lossy(&out.stdout);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (resp_body, status_line) = stdout.rsplit_once('\n').unwrap_or(("", stdout.trim()));
+    let http_code = status_line.trim().parse::<u16>().unwrap_or(0);
+    let raw = resp_body;
+
+    // Propagate HTTP errors immediately with the API's own message.
+    if http_code != 0 && http_code != 200 && http_code != 201 {
+        let api_msg = api_error_message(raw);
+        return Err(format!("HTTP {http_code}{api_msg}"));
+    }
+    if http_code == 0 {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            "Could not connect to API server".into()
+        } else {
+            format!("curl error: {}", &detail[..detail.len().min(120)])
+        });
+    }
+
     // Detect non-vision model and surface a clear error immediately.
     if raw.contains("must be a string") {
         return Err(format!(
@@ -573,13 +610,13 @@ fn query_groq_once(
     // Rate limit: sleep the suggested duration then return error so the outer
     // loop retries rather than hammering the API immediately.
     if raw.contains("rate_limit_exceeded") {
-        let wait = parse_retry_after(&raw).unwrap_or(6.0);
+        let wait = parse_retry_after(raw).unwrap_or(6.0);
         log_info!("rate limited — waiting {wait:.1}s");
         std::thread::sleep(std::time::Duration::from_millis((wait * 1000.0) as u64 + 500));
         return Err(format!("rate_limit — waited {wait:.1}s, retrying"));
     }
-    let resp: GroqResp = serde_json::from_str(&raw)
-        .map_err(|e| format!("Groq parse error: {e}\n---\n{raw}"))?;
+    let resp: GroqResp = serde_json::from_str(raw)
+        .map_err(|e| format!("API parse error: {e}\n---\n{raw}"))?;
     let choice  = resp.choices.into_iter().next().ok_or("no choices in response")?;
     let content = match choice.message.content {
         Some(ref c) if !c.is_empty() => c.clone(),

@@ -240,15 +240,20 @@ fn main() {
                     setStringValue: NSString::alloc(nil).init_str("Testing…")];
                 let popup: id  = ptrs.provider_popup as id;
                 let prov: i64  = msg_send![popup, indexOfSelectedItem];
+                // Trim whitespace so pasted keys with trailing newlines/spaces work correctly.
                 let ns_str_val = |ptr: usize| -> String {
                     let v: id = msg_send![ptr as id, stringValue];
-                    ns_str(v)
+                    ns_str(v).split_whitespace().collect::<Vec<_>>().join("")
+                };
+                let or_url = {
+                    let v = ns_str_val(ptrs.or_url_fld);
+                    if v.is_empty() { agent::OPENROUTER_URL_DEFAULT.into() } else { v }
                 };
                 let (key, model, url) = match prov {
                     1 => (
                         ns_str_val(ptrs.or_api_fld),
                         ns_str_val(ptrs.or_mdl_fld),
-                        ns_str_val(ptrs.or_url_fld),
+                        or_url,
                     ),
                     2 => {
                         let base = ns_str_val(ptrs.loc_url_fld);
@@ -281,10 +286,12 @@ fn main() {
                 let Some(ptrs) = MS_PTRS.get() else { return };
                 let popup: id  = ptrs.provider_popup as id;
                 let prov: i64  = msg_send![popup, indexOfSelectedItem];
+                // Remove all whitespace (newlines, spaces) from pasted keys.
                 let ns_str_val = |ptr: usize| -> String {
                     let v: id = msg_send![ptr as id, stringValue];
-                    ns_str(v)
+                    ns_str(v).split_whitespace().collect::<Vec<_>>().join("")
                 };
+                let or_url_raw = ns_str_val(ptrs.or_url_fld);
                 let mut cfg = POINTER_CONFIG.get().unwrap().lock().unwrap();
                 cfg.provider            = prov as u8;
                 cfg.groq_api_key        = ns_str_val(ptrs.groq_api_fld);
@@ -292,7 +299,7 @@ fn main() {
                 cfg.groq_url            = ns_str_val(ptrs.groq_url_fld);
                 cfg.openrouter_api_key  = ns_str_val(ptrs.or_api_fld);
                 cfg.openrouter_model    = ns_str_val(ptrs.or_mdl_fld);
-                cfg.openrouter_url      = ns_str_val(ptrs.or_url_fld);
+                cfg.openrouter_url      = if or_url_raw.is_empty() { agent::OPENROUTER_URL_DEFAULT.into() } else { or_url_raw };
                 cfg.local_base_url      = ns_str_val(ptrs.loc_url_fld);
                 cfg.local_api_key       = ns_str_val(ptrs.loc_key_fld);
                 cfg.local_model         = ns_str_val(ptrs.loc_mdl_fld);

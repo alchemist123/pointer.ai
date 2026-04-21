@@ -56,7 +56,14 @@ pub static STEP_IS_FINAL:     AtomicBool      = AtomicBool::new(false);
 pub static STEP_ACTION_CLICK: AtomicBool      = AtomicBool::new(false);
 pub static TOUR_AGENT:        OnceLock<Mutex<Option<TourAgent>>> = OnceLock::new();
 
-// Smooth dot animation
+// Active cursor screen (set in to_dot; used for capture + coordinate math)
+pub static CURSOR_SCREEN_ORIGIN_X: AtomicU64 = AtomicU64::new(0);
+pub static CURSOR_SCREEN_ORIGIN_Y: AtomicU64 = AtomicU64::new(0);
+pub static CURSOR_SCREEN_W:        AtomicU64 = AtomicU64::new(0);
+pub static CURSOR_SCREEN_H:        AtomicU64 = AtomicU64::new(0);
+pub static CURSOR_DISPLAY_IDX:     AtomicU32 = AtomicU32::new(1);
+
+// Primary screen height (needed for AppKit → CG coord conversion in show_step)
 pub static SCREEN_H_LOGICAL: AtomicU64 = AtomicU64::new(0);
 pub static STEP_TARGET_CG_X: AtomicU64 = AtomicU64::new(0);
 pub static STEP_TARGET_CG_Y: AtomicU64 = AtomicU64::new(0);
