@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::process::Command;
 
+use crate::memory::Memory;
 use crate::{log_ai, log_error, log_info};
 
 pub const GROQ_MODEL_DEFAULT:        &str = "meta-llama/llama-4-scout-17b-16e-instruct";
@@ -76,7 +77,7 @@ pub struct TourAgent {
     pub api_key:         String,
     pub api_url:         String,
     pub model:           String,
-    history:             Vec<String>,
+    memory:              Memory,
     step_num:            usize,
 }
 
@@ -90,7 +91,7 @@ impl TourAgent {
     ) -> Self {
         Self { goal, app, window, url, screen_w, screen_h,
                screen_origin_x, screen_origin_y, display_num,
-               api_key, api_url, model, history: Vec::new(), step_num: 0 }
+               api_key, api_url, model, memory: Memory::new(), step_num: 0 }
     }
 
     pub fn next_step(&mut self) -> Result<AgentStep, String> {
@@ -99,7 +100,7 @@ impl TourAgent {
         )?;
         let raw = query_groq(
             &self.goal, &self.app, &self.window, self.url.as_deref(),
-            &self.history, &b64, img_w as f64, img_h as f64,
+            &mut self.memory, &b64, img_w as f64, img_h as f64,
             &self.api_key, &self.api_url, &self.model,
         )?;
         self.step_num += 1;
@@ -110,7 +111,6 @@ impl TourAgent {
         let ly = raw.y * (self.screen_h / img_h as f64);
 
         // Translate capture-relative logical coords to global AppKit coords.
-        // AppKit origin is bottom-left; AI image origin is top-left, y-down.
         let ns_x = self.screen_origin_x + lx;
         let ns_y = self.screen_origin_y + self.screen_h - ly;
 
@@ -120,7 +120,7 @@ impl TourAgent {
             reason: raw.reason.clone(),
             step_num: n, is_final: raw.is_final,
         };
-        self.history.push(format!("Step {n} — {}: {}", raw.action, raw.description));
+        self.memory.push(n, &raw.action, &raw.description);
         Ok(step)
     }
 }
@@ -446,38 +446,29 @@ fn extract_kwarg(s: &str, key: &str) -> Option<String> {
 
 fn query_groq(
     goal: &str, app: &str, window: &str, url: Option<&str>,
-    history: &[String], screenshot_b64: &str, img_w: f64, img_h: f64,
+    memory: &mut Memory, screenshot_b64: &str, img_w: f64, img_h: f64,
     api_key: &str, api_url: &str, model: &str,
 ) -> Result<StepJson, String> {
-    // Detect loop: if the last 3 history entries share the same action keyword,
-    // the tour is stuck — inject a strong intervention hint.
-    let stuck_hint = if history.len() >= 3 {
-        let tail = &history[history.len()-3..];
-        // Extract the action word (between "— " and ":") from each entry.
-        let actions: Vec<&str> = tail.iter()
-            .filter_map(|s| s.split("— ").nth(1)?.split(':').next())
-            .collect();
-        if actions.len() == 3 && actions[0] == actions[1] && actions[1] == actions[2] {
-            format!(
-                "\n\nSTUCK LOOP DETECTED: You have repeated the action '{}' 3 times with no \
-                 progress. STOP repeating this action. You have two options:\n\
-                 1. If the goal is informational (comparing, finding info), look at the CURRENT \
-                    screenshot and answer the question directly — set is_final=true and put your \
-                    answer in description.\n\
-                 2. If navigation is truly needed, try a COMPLETELY DIFFERENT element or approach \
-                    than what you have been clicking.",
-                actions[0]
-            )
-        } else { String::new() }
+    // Stuck loop: 3 identical consecutive actions → register as mistake + inject hint.
+    let stuck_hint = if let Some(act) = memory.stuck_action().map(str::to_owned) {
+        memory.register_stuck();
+        format!(
+            "\n\nSTUCK LOOP DETECTED: You have repeated '{}' 3 times with no progress. \
+             STOP. Either try a COMPLETELY DIFFERENT element, or if the goal is \
+             answerable from what is visible, set is_final=true and answer directly.",
+            act
+        )
     } else { String::new() };
 
-    // Hard limit: if > 20 steps already done, force a final answer.
-    let max_hint = if history.len() >= 20 {
-        "\n\nMAX STEPS REACHED: You must now set is_final=true and give a complete \
-         answer/summary based on what you have seen so far. Do not take any more actions.".to_owned()
+    // Hard cap: force a final answer after 20 steps.
+    let max_hint = if memory.total_steps() >= 20 {
+        "\n\nMAX STEPS REACHED: Set is_final=true and give a complete answer/summary \
+         based on what you have seen so far.".to_owned()
     } else { String::new() };
 
-    let base_extra = format!("{stuck_hint}{max_hint}");
+    // Build history text once — includes compressed summary, recent window, and mistake list.
+    let history_text = memory.format_for_prompt();
+    let base_extra   = format!("{stuck_hint}{max_hint}");
 
     let oob_hint = format!(
         "\n\nWARNING: Your last response had coordinates outside the valid range \
@@ -490,7 +481,7 @@ fn query_groq(
     );
     let mut extra = base_extra.clone();
     for attempt in 0..3u8 {
-        match query_groq_once(goal, app, window, url, history, screenshot_b64,
+        match query_groq_once(goal, app, window, url, &history_text, screenshot_b64,
                               img_w, img_h, api_key, api_url, model, &extra) {
             Ok(s) if s.x > 1.0 && s.y > 1.0 && s.x < img_w-1.0 && s.y < img_h-1.0 => return Ok(s),
             Ok(s) => {
@@ -520,13 +511,10 @@ fn parse_retry_after(raw: &str) -> Option<f64> {
 
 fn query_groq_once(
     goal: &str, app: &str, window: &str, url: Option<&str>,
-    history: &[String], screenshot_b64: &str, img_w: f64, img_h: f64,
+    history_text: &str, screenshot_b64: &str, img_w: f64, img_h: f64,
     api_key: &str, api_url: &str, model: &str, extra_hint: &str,
 ) -> Result<StepJson, String> {
     let uitars = is_uitars_model(model);
-    let history_text = if history.is_empty() { "None yet.".to_owned() } else {
-        history.iter().enumerate().map(|(i,s)| format!("{}. {s}", i+1)).collect::<Vec<_>>().join("\n")
-    };
     let url_line = url.map(|u| format!("url:    {u}\n")).unwrap_or_default();
 
     let (sys_prompt, user_text, max_tokens) = if uitars {

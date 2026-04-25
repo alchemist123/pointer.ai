@@ -4,6 +4,7 @@ mod agent;
 mod config;
 mod events;
 pub mod logger;
+pub mod memory;
 mod state;
 mod tour;
 mod ui;
